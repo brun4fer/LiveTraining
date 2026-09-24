@@ -1,0 +1,1729 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, AlertTriangle, ArrowLeft, Camera, Check, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Download, Dumbbell, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Smartphone, Trash2, UserRound, Users, Video, X } from "lucide-react";
+
+import { TrainingEditDialog } from "@/components/training-edit-dialog";
+import { MomentEditDialog } from "@/components/moment-edit-dialog";
+import { PhoneCameraPairingDialog } from "@/components/phone-camera-pairing-dialog";
+import { Badge, Button, Panel, Select } from "@/components/ui";
+import type { AccountPayload, LiveSegmentRecord, LiveSessionRecord, TrainingDetail, MomentRecord, PlayerActionRecord, SettingsPayload } from "@/lib/domain";
+import { apiFetch } from "@/lib/http";
+import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type BrowserWebRtcSession } from "@/lib/cloudflare-webrtc";
+import { getRememberedTrainingVideoParts, rememberTrainingVideoPart, type LocalTrainingVideoPart, type LocalVideoFileHandle } from "@/lib/local-video-store";
+import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
+import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
+import { SmartVideoExportSession } from "@/lib/smart-video-export";
+import { formatTime, roundTime } from "@/lib/time";
+import { downloadBlob, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
+
+const CAPTURE_MODE_KEY = "live-training-capture-mode";
+const CAMERA_ROTATIONS_KEY = "live-training-camera-rotations";
+
+const captureProfiles = {
+  standard: {
+    label: "Standard",
+    width: 1920,
+    height: 1080,
+    frameRate: 30,
+    archiveVideoBitsPerSecond: 8_000_000,
+    replayVideoBitsPerSecond: 4_000_000,
+    segmentMilliseconds: 10_000,
+  },
+  compatibility: {
+    label: "Compatibility 720p",
+    width: 1280,
+    height: 720,
+    frameRate: 25,
+    archiveVideoBitsPerSecond: 5_000_000,
+    replayVideoBitsPerSecond: 2_500_000,
+    segmentMilliseconds: 10_000,
+  },
+} as const;
+
+type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
+type CaptureMode = keyof typeof captureProfiles;
+type CameraRotation = 0 | 90 | 180 | 270;
+type CaptureDiagnostics = {
+  width: number | null;
+  height: number | null;
+  frameRate: number | null;
+  archiveMimeType: string | null;
+  replayMimeType: string | null;
+  reconnections: number;
+  lastEvent: string;
+};
+type LiveViewer = { user: { id: string; name: string; username: string }; atLiveEdge: boolean; playbackPositionSeconds: number | null };
+type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
+type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
+type LocalFileHandle = LocalVideoFileHandle & { createWritable(): Promise<LocalWritableFile> };
+type LocalDirectoryHandle = { getFileHandle(name: string, options: { create: true }): Promise<LocalFileHandle> };
+type RotatedCameraResources = {
+  video: HTMLVideoElement;
+  stream: MediaStream;
+  cancelFrame: () => void;
+};
+type LocalReplaySegment = {
+  sequence: number;
+  startedAtSeconds: number;
+  durationSeconds: number;
+  mimeType: string;
+  blob: Blob;
+};
+
+function presenceClientId() {
+  const key = "live-training-presence-client";
+  const existing = window.localStorage.getItem(key);
+  if (existing) return existing;
+  const created = window.crypto.randomUUID();
+  window.localStorage.setItem(key, created);
+  return created;
+}
+
+function supportedSegmentMimeType() {
+  const options = ["video/webm;codecs=vp8,opus", "video/webm;codecs=vp9,opus", "video/webm"];
+  return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || "video/webm";
+}
+
+function codecLabel(mimeType: string | null) {
+  if (!mimeType) return "pending";
+  if (mimeType.includes("vp8")) return "VP8";
+  if (mimeType.includes("vp9")) return "VP9";
+  if (mimeType.includes("avc1") || mimeType.includes("h264")) return "H.264";
+  if (mimeType.includes("mp4")) return "MP4";
+  if (mimeType.includes("webm")) return "WebM";
+  return mimeType;
+}
+
+function supportedArchiveMimeType() {
+  const options = [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4;codecs=avc1,mp4a.40.2",
+    "video/mp4;codecs=h264,aac",
+    "video/mp4",
+  ];
+  return options.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) || null;
+}
+
+function localRecordingFileName(title: string, partNumber: number) {
+  const safeTitle = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "live-training";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${safeTitle}-Exercise-${partNumber}-${timestamp}.mp4`;
+}
+
+function mergeLiveSession(current: LiveSessionRecord | null, next: LiveSessionRecord | null) {
+  if (!next || !current || next.id !== current.id) return next;
+  const merged = new Map(current.segments.map((segment) => [segment.id, segment]));
+  for (const segment of next.segments) merged.set(segment.id, segment);
+  return { ...next, segments: [...merged.values()].sort((a, b) => a.sequence - b.sequence) };
+}
+
+function storedCameraRotation(deviceId: string): CameraRotation | null {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CAMERA_ROTATIONS_KEY) || "{}") as Record<string, number>;
+    const rotation = saved[deviceId || "default"];
+    return rotation === 0 || rotation === 90 || rotation === 180 || rotation === 270 ? rotation : null;
+  } catch {
+    return null;
+  }
+}
+
+function savedCameraRotation(deviceId: string): CameraRotation {
+  return storedCameraRotation(deviceId) ?? 0;
+}
+
+function rememberCameraRotation(deviceId: string, rotation: CameraRotation) {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CAMERA_ROTATIONS_KEY) || "{}") as Record<string, number>;
+    saved[deviceId || "default"] = rotation;
+    window.localStorage.setItem(CAMERA_ROTATIONS_KEY, JSON.stringify(saved));
+  } catch {
+    // A blocked localStorage must not prevent camera capture.
+  }
+}
+
+async function createRotatedCameraStream(source: MediaStream, rotation: Exclude<CameraRotation, 0>, frameRate: number): Promise<RotatedCameraResources> {
+  const sourceTrack = source.getVideoTracks()[0];
+  if (!sourceTrack) throw new Error("The selected camera does not provide a video track.");
+
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.autoplay = true;
+  video.srcObject = source;
+  if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out while preparing camera rotation."));
+      }, 10_000);
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener("loadedmetadata", loaded);
+        video.removeEventListener("error", failed);
+      };
+      const loaded = () => { cleanup(); resolve(); };
+      const failed = () => { cleanup(); reject(new Error("The camera image could not be prepared for rotation.")); };
+      video.addEventListener("loadedmetadata", loaded, { once: true });
+      video.addEventListener("error", failed, { once: true });
+    });
+  }
+  await video.play();
+
+  const settings = sourceTrack.getSettings();
+  const sourceWidth = video.videoWidth || settings.width || 1280;
+  const sourceHeight = video.videoHeight || settings.height || 720;
+  const swapsDimensions = rotation === 90 || rotation === 270;
+  const canvas = document.createElement("canvas");
+  canvas.width = swapsDimensions ? sourceHeight : sourceWidth;
+  canvas.height = swapsDimensions ? sourceWidth : sourceHeight;
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) throw new Error("The browser could not prepare the rotated camera image.");
+
+  const drawFrame = () => {
+    context.save();
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.translate(canvas.width / 2, canvas.height / 2);
+    context.rotate(rotation * Math.PI / 180);
+    context.drawImage(video, -sourceWidth / 2, -sourceHeight / 2, sourceWidth, sourceHeight);
+    context.restore();
+  };
+  drawFrame();
+
+  let cancelled = false;
+  let frameRequest = 0;
+  let videoFrameRequest = 0;
+  if (typeof video.requestVideoFrameCallback === "function") {
+    const drawVideoFrame = () => {
+      if (cancelled) return;
+      drawFrame();
+      videoFrameRequest = video.requestVideoFrameCallback(drawVideoFrame);
+    };
+    videoFrameRequest = video.requestVideoFrameCallback(drawVideoFrame);
+  } else {
+    const drawAnimationFrame = () => {
+      if (cancelled) return;
+      drawFrame();
+      frameRequest = window.requestAnimationFrame(drawAnimationFrame);
+    };
+    frameRequest = window.requestAnimationFrame(drawAnimationFrame);
+  }
+
+  const canvasStream = canvas.captureStream(frameRate);
+  const stream = new MediaStream([...canvasStream.getVideoTracks(), ...source.getAudioTracks()]);
+  const rotatedTrack = stream.getVideoTracks()[0];
+  if (rotatedTrack) rotatedTrack.contentHint = "motion";
+
+  return {
+    video,
+    stream,
+    cancelFrame: () => {
+      cancelled = true;
+      if (frameRequest) window.cancelAnimationFrame(frameRequest);
+      if (videoFrameRequest && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(videoFrameRequest);
+      video.pause();
+      video.srcObject = null;
+    },
+  };
+}
+
+export function LiveWorkspace({ trainingId }: { trainingId: string }) {
+  const router = useRouter();
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const replayVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteLiveVideoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  const rotatedCameraResourcesRef = useRef<RotatedCameraResources | null>(null);
+  const publisherSessionRef = useRef<BrowserWebRtcSession | null>(null);
+  const viewerSessionRef = useRef<BrowserWebRtcSession | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingRef = useRef(false);
+  const recorderTimerRef = useRef<number | null>(null);
+  const archiveRecorderRef = useRef<MediaRecorder | null>(null);
+  const archiveWriterRef = useRef<LocalWritableFile | null>(null);
+  const archiveWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  const archiveFinalizedRef = useRef<Promise<void> | null>(null);
+  const archiveFileNameRef = useRef<string | null>(null);
+  const archiveFileHandleRef = useRef<LocalFileHandle | null>(null);
+  const archiveDirectoryRef = useRef<LocalDirectoryHandle | null>(null);
+  const archivePartNumberRef = useRef(1);
+  const archivePartStartedAtRef = useRef(0);
+  const localSegmentUrlsRef = useRef(new Map<number, string>());
+  const localReplaySegmentsRef = useRef(new Map<number, LocalReplaySegment>());
+  const localPartUrlsRef = useRef(new Map<string, string>());
+  const sequenceRef = useRef(0);
+  const segmentTimelineCursorRef = useRef(0);
+  const segmentStartedAtClockRef = useRef(0);
+  const fetchedSequenceRef = useRef(-1);
+  const replayCommandRef = useRef(0);
+  const pendingUploadsRef = useRef(new Set<Promise<void>>());
+  const presenceStateRef = useRef({ atLiveEdge: true, playheadSeconds: 0 });
+  const cameraStreamGenerationRef = useRef(0);
+  const cameraMuteTimerRef = useRef<number | null>(null);
+  const cameraLossHandlingRef = useRef(false);
+  const successfulCameraConnectionsRef = useRef(0);
+
+  const [training, setTraining] = useState<TrainingDetail | null>(null);
+  const [settings, setSettings] = useState<SettingsPayload | null>(null);
+  const [account, setAccount] = useState<AccountPayload | null>(null);
+  const [session, setSession] = useState<LiveSessionRecord | null>(null);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [deviceId, setDeviceId] = useState("");
+  const [cameraRotation, setCameraRotation] = useState<CameraRotation>(0);
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("standard");
+  const [captureDiagnostics, setCaptureDiagnostics] = useState<CaptureDiagnostics>({
+    width: null,
+    height: null,
+    frameRate: null,
+    archiveMimeType: null,
+    replayMimeType: null,
+    reconnections: 0,
+    lastEvent: "Waiting for camera",
+  });
+  const [cameraConnected, setCameraConnected] = useState(false);
+  const [cameraProblem, setCameraProblem] = useState<string | null>(null);
+  const [remoteLiveStream, setRemoteLiveStream] = useState<MediaStream | null>(null);
+  const [remotePlaybackNeedsAction, setRemotePlaybackNeedsAction] = useState(false);
+  const [realtimeConnecting, setRealtimeConnecting] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [pausing, setPausing] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [localArchiveName, setLocalArchiveName] = useState<string | null>(null);
+  const [localParts, setLocalParts] = useState<LocalTrainingVideoPart[]>([]);
+  const [atLiveEdge, setAtLiveEdge] = useState(true);
+  const [replayTarget, setReplayTarget] = useState<ReplayTarget | null>(null);
+  const [playheadSeconds, setPlayheadSeconds] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [seekTime, setSeekTime] = useState("");
+  const [previewEnd, setPreviewEnd] = useState<number | null>(null);
+  const [selectedMomentId, setSelectedMomentId] = useState<string | null>(null);
+  const [pendingMomentReviewId, setPendingMomentReviewId] = useState<string | null>(null);
+  const [busyMomentTypeId, setBusyMomentTypeId] = useState<string | null>(null);
+  const [busyPlayerId, setBusyPlayerId] = useState<string | null>(null);
+  const [editingMoment, setEditingMoment] = useState<MomentRecord | null>(null);
+  const [exportingMomentId, setExportingMomentId] = useState<string | null>(null);
+  const [editingTraining, setEditingTraining] = useState(false);
+  const [pairingPhone, setPairingPhone] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
+  const [clock, setClock] = useState(() => Date.now());
+
+  function disposeRotatedCameraOutput() {
+    const resources = rotatedCameraResourcesRef.current;
+    if (!resources) return;
+    resources.cancelFrame();
+    resources.stream.getVideoTracks().forEach((track) => track.stop());
+    rotatedCameraResourcesRef.current = null;
+  }
+
+  async function applyCameraRotation(source: MediaStream, rotation: CameraRotation) {
+    disposeRotatedCameraOutput();
+    if (rotation === 0) {
+      captureStreamRef.current = source;
+    } else {
+      const resources = await createRotatedCameraStream(source, rotation, captureProfiles[captureMode].frameRate);
+      rotatedCameraResourcesRef.current = resources;
+      captureStreamRef.current = resources.stream;
+    }
+    if (cameraVideoRef.current) cameraVideoRef.current.srcObject = captureStreamRef.current;
+  }
+
+  function stopCameraStreams() {
+    cameraStreamGenerationRef.current += 1;
+    disposeRotatedCameraOutput();
+    const source = streamRef.current;
+    captureStreamRef.current = null;
+    streamRef.current = null;
+    source?.getTracks().forEach((track) => track.stop());
+    if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null;
+  }
+
+  const applySession = useCallback((next: LiveSessionRecord | null) => {
+    setSession((current) => mergeLiveSession(current, next));
+    if (!next) return;
+    sequenceRef.current = Math.max(sequenceRef.current, ...next.segments.map((item) => item.sequence + 1), 0);
+    fetchedSequenceRef.current = Math.max(fetchedSequenceRef.current, ...next.segments.filter((item) => item.status === "READY").map((item) => item.sequence), -1);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const [nextTraining, nextSettings, nextAccount, nextSession] = await Promise.all([
+      apiFetch<TrainingDetail>(`/api/trainings/${trainingId}`),
+      apiFetch<SettingsPayload>("/api/settings"),
+      apiFetch<AccountPayload>("/api/account"),
+      apiFetch<LiveSessionRecord | null>(`/api/trainings/${trainingId}/live`),
+    ]);
+    setTraining(nextTraining);
+    setSettings(nextSettings);
+    setAccount(nextAccount);
+    setSelectedMomentId((current) => current || nextTraining.moments[0]?.id || null);
+    applySession(nextSession);
+  }, [applySession, trainingId]);
+
+  useEffect(() => {
+    refresh().catch((error: Error) => setNotice(error.message)).finally(() => setLoading(false));
+  }, [refresh]);
+
+  useEffect(() => {
+    let active = true;
+    getRememberedTrainingVideoParts(trainingId).then((parts) => {
+      if (!active) return;
+      for (const part of parts) {
+        if (!localPartUrlsRef.current.has(part.id)) localPartUrlsRef.current.set(part.id, URL.createObjectURL(part.file));
+      }
+      setLocalParts(parts);
+      segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, ...parts.map((part) => part.startTimeSeconds + part.durationSeconds), 0);
+      setPlayheadSeconds((current) => Math.max(current, segmentTimelineCursorRef.current));
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [trainingId]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const savedMode = window.localStorage.getItem(CAPTURE_MODE_KEY);
+    if (savedMode === "standard" || savedMode === "compatibility") setCaptureMode(savedMode);
+    setCameraRotation(savedCameraRotation(""));
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const cursor = fetchedSequenceRef.current;
+      Promise.all([
+        apiFetch<LiveSessionRecord | null>(`/api/trainings/${trainingId}/live?afterSequence=${Math.max(-1, cursor)}`),
+        apiFetch<TrainingDetail>(`/api/trainings/${trainingId}`),
+      ]).then(([nextSession, nextTraining]) => {
+        applySession(nextSession);
+        setTraining(nextTraining);
+      }).catch(() => undefined);
+    }, 2_500);
+    return () => window.clearInterval(timer);
+  }, [applySession, trainingId]);
+
+  useEffect(() => () => {
+    recordingRef.current = false;
+    cameraStreamGenerationRef.current += 1;
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+    if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (archiveRecorderRef.current && archiveRecorderRef.current.state !== "inactive") archiveRecorderRef.current.stop();
+    closeWebRtcSession(publisherSessionRef.current);
+    closeWebRtcSession(viewerSessionRef.current);
+    publisherSessionRef.current = null;
+    viewerSessionRef.current = null;
+    disposeRotatedCameraOutput();
+    captureStreamRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    for (const url of localSegmentUrlsRef.current.values()) URL.revokeObjectURL(url);
+    localSegmentUrlsRef.current.clear();
+    localReplaySegmentsRef.current.clear();
+    for (const url of localPartUrlsRef.current.values()) URL.revokeObjectURL(url);
+    localPartUrlsRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    if (!recording && !paused && !stopping) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [paused, recording, stopping]);
+
+  useEffect(() => {
+    if (cameraVideoRef.current && captureStreamRef.current) cameraVideoRef.current.srcObject = captureStreamRef.current;
+  }, [cameraConnected, atLiveEdge]);
+
+  useEffect(() => {
+    const video = remoteLiveVideoRef.current;
+    if (!video || !remoteLiveStream) return;
+    video.srcObject = remoteLiveStream;
+    void video.play().then(() => setRemotePlaybackNeedsAction(false)).catch(() => setRemotePlaybackNeedsAction(true));
+  }, [atLiveEdge, remoteLiveStream]);
+
+  const readySegments = useMemo(() => {
+    const partSegments: LiveSegmentRecord[] = localParts.map((part) => ({
+      id: `local-part-${part.id}`,
+      sequence: part.partNumber * 1_000_000,
+      startedAtSeconds: part.startTimeSeconds,
+      durationSeconds: part.durationSeconds,
+      mimeType: part.file.type || "video/mp4",
+      fileSize: String(part.file.size),
+      status: "READY",
+      readyAt: new Date(part.savedAt).toISOString(),
+      playbackUrl: localPartUrlsRef.current.get(part.id) || null,
+      playbackUrlExpiresAt: null,
+    }));
+    const sessionSegments = session?.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl) || [];
+    const uncoveredSegments = sessionSegments.filter((segment) => !localParts.some((part) => {
+      const end = part.startTimeSeconds + part.durationSeconds;
+      return segment.startedAtSeconds >= part.startTimeSeconds - 0.05 && segment.startedAtSeconds < end - 0.05;
+    }));
+    return [...partSegments, ...uncoveredSegments].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds || a.sequence - b.sequence);
+  }, [localParts, session?.segments]);
+  const selectedSegment = readySegments.find((segment) => segment.id === replayTarget?.segmentId) || null;
+  const availableEdgeSeconds = getReplayEdge(readySegments);
+  const activeSegmentSeconds = recording && segmentStartedAtClockRef.current
+    ? Math.max(0, (clock - segmentStartedAtClockRef.current) / 1000)
+    : 0;
+  const latestRemoteSegment = session?.segments.filter((segment) => segment.status === "READY").at(-1);
+  const remoteSegmentClock = latestRemoteSegment?.readyAt || session?.recordingStartedAt;
+  const remoteActiveSeconds = remoteLiveStream && remoteSegmentClock
+    ? Math.min(12, Math.max(0, (clock - Date.parse(remoteSegmentClock)) / 1000))
+    : 0;
+  const liveEdgeSeconds = Math.max(availableEdgeSeconds + remoteActiveSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds);
+  const currentTime = atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
+  const activeLive = session?.status === "LIVE";
+  const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
+  const currentExercise = training?.exercises.find((exercise) => exercise.endTimeSeconds === null) ?? null;
+  const lastMoment = training?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
+
+  useEffect(() => {
+    const playbackUrl = session?.playbackUrl;
+    if (!activeLive || !atLiveEdge || cameraConnected || !playbackUrl) {
+      closeWebRtcSession(viewerSessionRef.current);
+      viewerSessionRef.current = null;
+      setRemoteLiveStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+      setRealtimeConnecting(false);
+      setRemotePlaybackNeedsAction(false);
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: number | null = null;
+
+    const disconnect = () => {
+      closeWebRtcSession(viewerSessionRef.current);
+      viewerSessionRef.current = null;
+      setRemoteLiveStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+    };
+    const retry = () => {
+      if (!cancelled && retryTimer === null) retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void connect();
+      }, 2_500);
+    };
+    const connect = async () => {
+      disconnect();
+      setRealtimeConnecting(true);
+      try {
+        const received = await receiveCameraStream(playbackUrl);
+        if (cancelled) {
+          received.stream.getTracks().forEach((track) => track.stop());
+          closeWebRtcSession(received);
+          return;
+        }
+        viewerSessionRef.current = received;
+        received.peer.onconnectionstatechange = () => {
+          if (!["failed", "closed", "disconnected"].includes(received.peer.connectionState) || cancelled || viewerSessionRef.current !== received) return;
+          disconnect();
+          retry();
+        };
+        setRemoteLiveStream(received.stream);
+        setRealtimeConnecting(false);
+      } catch {
+        if (!cancelled) {
+          setRealtimeConnecting(false);
+          retry();
+        }
+      }
+    };
+
+    void connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      disconnect();
+      setRealtimeConnecting(false);
+    };
+  }, [activeLive, atLiveEdge, cameraConnected, session?.id, session?.playbackUrl]);
+
+  useEffect(() => {
+    const video = replayVideoRef.current;
+    if (!video || !selectedSegment || !replayTarget) return;
+    const applyTarget = () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : selectedSegment.durationSeconds || 0;
+      video.currentTime = Math.max(0, Math.min(Math.max(0, duration - 0.02), replayTarget.offsetSeconds));
+      video.playbackRate = playbackRate;
+      if (replayTarget.autoplay) void video.play();
+      else video.pause();
+    };
+    if (video.readyState >= 1) applyTarget();
+    else video.addEventListener("loadedmetadata", applyTarget, { once: true });
+    return () => video.removeEventListener("loadedmetadata", applyTarget);
+  }, [replayTarget?.command, selectedSegment?.id, selectedSegment?.playbackUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!atLiveEdge || cameraConnected || !activeLive || readySegments.length === 0) return;
+    const latest = readySegments[readySegments.length - 1];
+    setReplayTarget((current) => {
+      if (current?.segmentId === latest.id) return current;
+      setPlayheadSeconds(latest.startedAtSeconds);
+      return { segmentId: latest.id, offsetSeconds: 0, autoplay: true, command: ++replayCommandRef.current };
+    });
+  }, [activeLive, atLiveEdge, cameraConnected, readySegments]);
+
+  useEffect(() => {
+    presenceStateRef.current = { atLiveEdge, playheadSeconds: currentTime };
+  }, [atLiveEdge, currentTime]);
+
+  useEffect(() => {
+    if (!session?.id) return;
+    const liveSessionId = session.id;
+    const clientId = presenceClientId();
+    let stopped = false;
+    async function heartbeat() {
+      try {
+        const presence = presenceStateRef.current;
+        const result = await apiFetch<{ liveViewers: LiveViewer[] }>("/api/presence", {
+          method: "POST",
+          body: JSON.stringify({ clientId, liveSessionId, playbackPositionSeconds: presence.playheadSeconds, atLiveEdge: presence.atLiveEdge }),
+        });
+        if (!stopped) setLiveViewers(result.liveViewers);
+      } catch {
+        // Presence must never interrupt recording or replay.
+      }
+    }
+    void heartbeat();
+    const timer = window.setInterval(() => void heartbeat(), 5_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      void apiFetch("/api/presence", { method: "POST", body: JSON.stringify({ clientId, liveSessionId: null, playbackPositionSeconds: null, atLiveEdge: true }) }).catch(() => undefined);
+    };
+  }, [session?.id]);
+
+  const openSegment = useCallback((segment: LiveSegmentRecord, offsetSeconds = 0, autoplay = true, keepLiveEdge = false) => {
+    const duration = segment.durationSeconds || 0;
+    const safeOffset = Math.max(0, Math.min(Math.max(0, duration - 0.02), offsetSeconds));
+    setAtLiveEdge(keepLiveEdge);
+    setPlayheadSeconds(segment.startedAtSeconds + safeOffset);
+    setReplayTarget({ segmentId: segment.id, offsetSeconds: safeOffset, autoplay, command: ++replayCommandRef.current });
+  }, []);
+
+  const seekVirtual = useCallback((seconds: number, autoplay = true) => {
+    const position = locateReplayPosition(readySegments, seconds);
+    if (!position) return false;
+    openSegment(position.segment, position.offsetSeconds, autoplay, false);
+    return true;
+  }, [openSegment, readySegments]);
+
+  useEffect(() => {
+    if (!pendingMomentReviewId || !training) return;
+    const moment = training.moments.find((item) => item.id === pendingMomentReviewId);
+    if (!moment) return setPendingMomentReviewId(null);
+    const sources: TimedVideoSource[] = readySegments
+      .filter((segment) => segment.playbackUrl && segment.durationSeconds)
+      .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
+    if (!planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete) return;
+    setPendingMomentReviewId(null);
+    setPreviewEnd(moment.endTimeSeconds);
+    if (seekVirtual(moment.startTimeSeconds, true)) setNotice(`${moment.momentType.name} is ready for replay.`);
+  }, [training, pendingMomentReviewId, readySegments, seekVirtual]);
+
+  const goLive = useCallback(() => {
+    setPendingMomentReviewId(null);
+    setPreviewEnd(null);
+    setAtLiveEdge(true);
+    if (cameraConnected || session?.playbackUrl) {
+      setReplayTarget(null);
+      setPlayheadSeconds(liveEdgeSeconds);
+      setPlaying(true);
+      if (!cameraConnected && remoteLiveVideoRef.current) void remoteLiveVideoRef.current.play().catch(() => setRemotePlaybackNeedsAction(true));
+      return;
+    }
+    const latest = readySegments.at(-1);
+    if (latest) openSegment(latest, 0, true, true);
+  }, [cameraConnected, liveEdgeSeconds, openSegment, readySegments, session?.playbackUrl]);
+
+  const togglePlayback = useCallback(() => {
+    setPreviewEnd(null);
+    if (atLiveEdge && (cameraConnected || remoteLiveStream)) {
+      if (!cameraConnected && remoteLiveVideoRef.current?.paused) {
+        void remoteLiveVideoRef.current.play().catch(() => setRemotePlaybackNeedsAction(true));
+        return;
+      }
+      if (availableEdgeSeconds > 0) seekVirtual(availableEdgeSeconds - 0.05, false);
+      else if (!cameraConnected) remoteLiveVideoRef.current?.pause();
+      return;
+    }
+    const video = replayVideoRef.current;
+    if (video) {
+      if (video.paused) void video.play();
+      else video.pause();
+      return;
+    }
+    const latest = readySegments.at(-1);
+    if (latest) openSegment(latest, 0, true, false);
+  }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, remoteLiveStream, seekVirtual]);
+
+  const markMoment = useCallback(async (momentTypeId: string) => {
+    if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
+    if (!recording && !remoteLiveStream) return setNotice("Start an exercise before tagging a new moment.");
+    if (paused) return setNotice("Start an exercise before tagging a new moment.");
+    const markedAtSeconds = atLiveEdge ? liveEdgeSeconds : playheadSeconds;
+    const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? archivePartStartedAtRef.current;
+    setBusyMomentTypeId(momentTypeId);
+    try {
+      const saved = await apiFetch<MomentRecord>(`/api/trainings/${trainingId}/live/moments`, {
+        method: "POST",
+        body: JSON.stringify({ liveSessionId: session.id, momentTypeId, markedAtSeconds, leadSeconds: 20, partStartedAtSeconds }),
+      });
+      setTraining((current) => current ? { ...current, moments: [...current.moments, saved].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds), momentCount: current.momentCount + 1 } : current);
+      setSelectedMomentId(saved.id);
+      setNotice(`${saved.momentType.name} saved: ${formatTime(saved.startTimeSeconds)} – ${formatTime(saved.endTimeSeconds)}.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The moment could not be saved.");
+    } finally {
+      setBusyMomentTypeId(null);
+    }
+  }, [atLiveEdge, liveEdgeSeconds, localParts, trainingId, paused, playheadSeconds, recording, remoteLiveStream, session]);
+
+  const markPlayerAction = useCallback(async (playerId: string) => {
+    if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a player action.");
+    if (!recording && !remoteLiveStream) return setNotice("Start an exercise before tagging a player action.");
+    if (paused) return setNotice("Start an exercise before tagging a player action.");
+    const markedAtSeconds = atLiveEdge ? liveEdgeSeconds : playheadSeconds;
+    const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? archivePartStartedAtRef.current;
+    setBusyPlayerId(playerId);
+    try {
+      const saved = await apiFetch<PlayerActionRecord>(`/api/trainings/${trainingId}/live/player-actions`, {
+        method: "POST",
+        body: JSON.stringify({ liveSessionId: session.id, playerId, markedAtSeconds, leadSeconds: 15, partStartedAtSeconds }),
+      });
+      setTraining((current) => current ? { ...current, playerActions: [...current.playerActions, saved].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds), playerActionCount: current.playerActionCount + 1 } : current);
+      setNotice(`${saved.player.name}: previous 15 seconds saved.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The player action could not be saved.");
+    } finally {
+      setBusyPlayerId(null);
+    }
+  }, [atLiveEdge, liveEdgeSeconds, localParts, paused, playheadSeconds, recording, remoteLiveStream, session, trainingId]);
+
+  async function startExerciseAt(timeSeconds: number) {
+    const exercise = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, { method: "POST", body: JSON.stringify({ action: "start", timeSeconds: roundTime(timeSeconds) }) });
+    setTraining((current) => current ? { ...current, exercises: [...current.exercises, exercise], exerciseCount: current.exerciseCount + 1 } : current);
+    return exercise;
+  }
+
+  async function endExerciseAt(timeSeconds: number) {
+    const exercise = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, { method: "POST", body: JSON.stringify({ action: "end", timeSeconds: roundTime(timeSeconds) }) });
+    setTraining((current) => current ? { ...current, exercises: current.exercises.map((item) => item.id === exercise.id ? exercise : item) } : current);
+    return exercise;
+  }
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable || target?.matches("input, textarea, select")) return;
+      if (editingMoment || editingTraining) return;
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        setPreviewEnd(null);
+        void seekVirtual(currentTime + (event.key === "ArrowLeft" ? -5 : 5), atLiveEdge || playing);
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        togglePlayback();
+        return;
+      }
+      const type = settings?.momentTypes.find((item) => item.active && item.defaultShortcut?.toLowerCase() === event.key.toLowerCase());
+      if (!type) return;
+      event.preventDefault();
+      void markMoment(type.id);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [atLiveEdge, currentTime, editingTraining, editingMoment, markMoment, playing, seekVirtual, settings?.momentTypes, togglePlayback]);
+
+  function monitorCameraStream(stream: MediaStream) {
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) return;
+    const generation = ++cameraStreamGenerationRef.current;
+    const isCurrentStream = () => generation === cameraStreamGenerationRef.current && streamRef.current === stream;
+
+    videoTrack.addEventListener("ended", () => {
+      if (isCurrentStream()) void handleCameraLoss("The camera connection was lost. Check the HDMI, capture card and USB cables.");
+    });
+    videoTrack.addEventListener("mute", () => {
+      if (!isCurrentStream()) return;
+      if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+      cameraMuteTimerRef.current = window.setTimeout(() => {
+        cameraMuteTimerRef.current = null;
+        if (isCurrentStream() && videoTrack.muted) {
+          void handleCameraLoss("The camera stopped sending images. Check the HDMI signal and capture card.");
+        }
+      }, 2_500);
+    });
+    videoTrack.addEventListener("unmute", () => {
+      if (!isCurrentStream()) return;
+      if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+      cameraMuteTimerRef.current = null;
+    });
+  }
+
+  async function handleCameraLoss(message: string) {
+    if (cameraLossHandlingRef.current || !streamRef.current) return;
+    cameraLossHandlingRef.current = true;
+    setCaptureDiagnostics((current) => ({ ...current, lastEvent: message }));
+    const failedStream = streamRef.current;
+    const wasRecording = recordingRef.current;
+    cameraStreamGenerationRef.current += 1;
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+    cameraMuteTimerRef.current = null;
+    setCameraConnected(false);
+    setCameraProblem(wasRecording ? `${message} Saving the current exercise…` : message);
+
+    if (!wasRecording) {
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
+      cameraLossHandlingRef.current = false;
+      return;
+    }
+
+    recordingRef.current = false;
+    setRecording(false);
+    setPausing(true);
+    if (recorderTimerRef.current !== null) {
+      window.clearTimeout(recorderTimerRef.current);
+      recorderTimerRef.current = null;
+    }
+
+    try {
+      const segmentRecorder = recorderRef.current;
+      if (segmentRecorder?.state === "recording") {
+        await new Promise<void>((resolve) => {
+          segmentRecorder.addEventListener("stop", () => resolve(), { once: true });
+          segmentRecorder.stop();
+        });
+      }
+      closeWebRtcSession(publisherSessionRef.current);
+      publisherSessionRef.current = null;
+      const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
+      setPaused(true);
+      setAtLiveEdge(false);
+      if (completedPart) {
+        setPlayheadSeconds(completedPart.startTimeSeconds);
+        setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+        setCameraProblem(`${message} Exercise ${completedPart.partNumber} was preserved as ${completedPart.fileName}. Secure the connection, then reconnect and continue.`);
+      } else {
+        setCameraProblem(`${message} Secure the connection, then reconnect and continue. Previously completed exercises remain available.`);
+      }
+    } catch (error) {
+      if (streamRef.current === failedStream) stopCameraStreams();
+      else failedStream.getTracks().forEach((track) => track.stop());
+      setPaused(true);
+      setCameraProblem(`${message} ${error instanceof Error ? error.message : "The current exercise could not be finalized cleanly."} Previously completed exercises remain available.`);
+    } finally {
+      setPausing(false);
+      cameraLossHandlingRef.current = false;
+    }
+  }
+
+  function changeCaptureMode(nextMode: CaptureMode) {
+    setCaptureMode(nextMode);
+    window.localStorage.setItem(CAPTURE_MODE_KEY, nextMode);
+    setCaptureDiagnostics((current) => ({
+      ...current,
+      lastEvent: `${captureProfiles[nextMode].label} selected${cameraConnected ? "; reconnect the camera to apply it" : ""}`,
+    }));
+    if (cameraConnected) setNotice(`${captureProfiles[nextMode].label} selected. Use the camera button to reconnect and apply it.`);
+  }
+
+  function changeCameraDevice(nextDeviceId: string) {
+    setDeviceId(nextDeviceId);
+    setCameraRotation(savedCameraRotation(nextDeviceId));
+    if (cameraConnected) setNotice("Camera selected. Use the camera button to reconnect and apply it.");
+  }
+
+  async function rotateCamera() {
+    if (recording || pausing || stopping) return;
+    const nextRotation = ((cameraRotation + 90) % 360) as CameraRotation;
+    setCameraRotation(nextRotation);
+    rememberCameraRotation(deviceId, nextRotation);
+
+    const source = streamRef.current;
+    if (!source || !cameraConnected) {
+      setNotice(`Camera rotation set to ${nextRotation}°. It will be applied when the camera connects.`);
+      return;
+    }
+
+    try {
+      await applyCameraRotation(source, nextRotation);
+      const settings = source.getVideoTracks()[0]?.getSettings();
+      const swapsDimensions = nextRotation === 90 || nextRotation === 270;
+      setCaptureDiagnostics((current) => ({
+        ...current,
+        width: swapsDimensions ? settings?.height ?? null : settings?.width ?? null,
+        height: swapsDimensions ? settings?.width ?? null : settings?.height ?? null,
+        lastEvent: `Camera rotated to ${nextRotation}°`,
+      }));
+      setNotice(`Camera rotated to ${nextRotation}°. Preview and saved recordings now use this orientation.`);
+    } catch (error) {
+      await applyCameraRotation(source, 0).catch(() => undefined);
+      setCameraRotation(0);
+      rememberCameraRotation(deviceId, 0);
+      setNotice(error instanceof Error ? error.message : "The camera image could not be rotated.");
+    }
+  }
+
+  async function connectCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setNotice("Camera capture is not supported in this browser.");
+      return false;
+    }
+    if (cameraMuteTimerRef.current !== null) window.clearTimeout(cameraMuteTimerRef.current);
+    cameraMuteTimerRef.current = null;
+    stopCameraStreams();
+    setCameraConnected(false);
+    try {
+      const profile = captureProfiles[captureMode];
+      const defaultVideo = captureMode === "compatibility"
+        ? {
+            width: { ideal: profile.width, max: profile.width },
+            height: { ideal: profile.height, max: profile.height },
+            frameRate: { ideal: profile.frameRate, max: 30 },
+          }
+        : {
+            width: { ideal: profile.width },
+            height: { ideal: profile.height },
+            frameRate: { ideal: profile.frameRate },
+          };
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: deviceId ? { ...defaultVideo, deviceId: { exact: deviceId } } : defaultVideo,
+          audio: true,
+        });
+      } catch (firstError) {
+        const canRetryDefault = deviceId && firstError instanceof DOMException && ["NotFoundError", "OverconstrainedError", "NotReadableError"].includes(firstError.name);
+        if (!canRetryDefault) throw firstError;
+        stream = await navigator.mediaDevices.getUserMedia({ video: defaultVideo, audio: true });
+      }
+      streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) videoTrack.contentHint = "motion";
+      const trackSettings = videoTrack?.getSettings();
+      const activeDevice = trackSettings?.deviceId;
+      const rotationToApply = !deviceId && activeDevice
+        ? storedCameraRotation(activeDevice) ?? cameraRotation
+        : cameraRotation;
+      setCameraRotation(rotationToApply);
+      await applyCameraRotation(stream, rotationToApply);
+      monitorCameraStream(stream);
+      setCameraConnected(true);
+      setCameraProblem(null);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      const available = await navigator.mediaDevices.enumerateDevices();
+      setDevices(available.filter((device) => device.kind === "videoinput"));
+      if (activeDevice) {
+        setDeviceId(activeDevice);
+        rememberCameraRotation(activeDevice, rotationToApply);
+      }
+      const reconnecting = successfulCameraConnectionsRef.current > 0;
+      successfulCameraConnectionsRef.current += 1;
+      setCaptureDiagnostics((current) => ({
+        ...current,
+        width: rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.height ?? null : trackSettings?.width ?? null,
+        height: rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.width ?? null : trackSettings?.height ?? null,
+        frameRate: trackSettings?.frameRate ?? null,
+        archiveMimeType: null,
+        replayMimeType: null,
+        reconnections: current.reconnections + (reconnecting ? 1 : 0),
+        lastEvent: reconnecting ? "Camera reconnected" : "Camera connected",
+      }));
+      const outputWidth = rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.height : trackSettings?.width;
+      const outputHeight = rotationToApply === 90 || rotationToApply === 270 ? trackSettings?.width : trackSettings?.height;
+      const actualResolution = outputWidth && outputHeight ? ` at ${outputWidth}×${outputHeight}` : "";
+      const rotationLabel = rotationToApply ? `, rotated ${rotationToApply}°` : "";
+      setNotice(`${profile.label} camera connected${actualResolution}${rotationLabel}. Start the live session when the training feed is ready.`);
+      return true;
+    } catch (error) {
+      stopCameraStreams();
+      const message = error instanceof Error ? error.message : "The camera could not be opened.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `Connection failed: ${message}` }));
+      setNotice(message);
+      setCameraProblem(`The camera could not be reconnected. ${message} Check the cable and try again.`);
+      return false;
+    }
+  }
+
+  async function chooseLocalRecordingFolder() {
+    const pickerWindow = window as Window & {
+      showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite"; startIn?: string }) => Promise<LocalDirectoryHandle>;
+    };
+    if (!pickerWindow.showDirectoryPicker) {
+      setNotice("Folder recording requires desktop Chrome or Edge. Open Live Training there and try again.");
+      return null;
+    }
+    try {
+      return await pickerWindow.showDirectoryPicker.call(window, { id: "live-training-recordings", mode: "readwrite", startIn: "videos" });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") setNotice("Live recording was not started because no local folder was selected.");
+      else setNotice(error instanceof Error ? error.message : "The selected folder could not be opened.");
+      return null;
+    }
+  }
+
+  async function startLocalArchive(directory: LocalDirectoryHandle, partNumber: number, startTimeSeconds: number) {
+    if (!captureStreamRef.current || !training) throw new Error("Connect the camera before creating the local recording.");
+    const fileName = localRecordingFileName(training.title, partNumber);
+    const fileHandle = await directory.getFileHandle(fileName, { create: true });
+    const writer = await fileHandle.createWritable();
+    const mimeType = supportedArchiveMimeType();
+    if (!mimeType) {
+      await writer.abort?.().catch(() => undefined);
+      throw new Error("This browser cannot record the complete training as MP4. Update Chrome or Edge and try again.");
+    }
+    let archiveRecorder: MediaRecorder;
+    try {
+      archiveRecorder = new MediaRecorder(captureStreamRef.current, {
+        mimeType,
+        videoBitsPerSecond: captureProfiles[captureMode].archiveVideoBitsPerSecond,
+        audioBitsPerSecond: 128_000,
+      });
+    } catch (error) {
+      await writer.abort?.().catch(() => undefined);
+      throw error;
+    }
+
+    archiveWriterRef.current = writer;
+    archiveRecorderRef.current = archiveRecorder;
+    archiveFileHandleRef.current = fileHandle;
+    archiveDirectoryRef.current = directory;
+    archivePartNumberRef.current = partNumber;
+    archivePartStartedAtRef.current = startTimeSeconds;
+    archiveWriteChainRef.current = Promise.resolve();
+    archiveFileNameRef.current = fileName;
+    setLocalArchiveName(fileName);
+    setCaptureDiagnostics((current) => ({ ...current, archiveMimeType: mimeType, lastEvent: `Recording exercise ${partNumber}` }));
+    let resolveFinalization!: () => void;
+    let rejectFinalization!: (reason?: unknown) => void;
+    archiveFinalizedRef.current = new Promise<void>((resolve, reject) => {
+      resolveFinalization = resolve;
+      rejectFinalization = reject;
+    });
+    archiveRecorder.ondataavailable = (event) => {
+      if (!event.data.size) return;
+      archiveWriteChainRef.current = archiveWriteChainRef.current.then(() => writer.write(event.data));
+      void archiveWriteChainRef.current.catch(() => undefined);
+    };
+    archiveRecorder.onerror = (event) => {
+      const recorderError = (event as Event & { error?: DOMException }).error;
+      const message = recorderError?.message || "The main MP4 recorder reported an error.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `MP4 recorder error: ${message}` }));
+      void handleCameraLoss(message);
+    };
+    archiveRecorder.onstop = async () => {
+      try {
+        await archiveWriteChainRef.current;
+        await writer.close();
+        resolveFinalization();
+      } catch (error) {
+        await writer.abort?.().catch(() => undefined);
+        rejectFinalization(error);
+      } finally {
+        archiveRecorderRef.current = null;
+        archiveWriterRef.current = null;
+      }
+    };
+    archiveRecorder.start(1_000);
+  }
+
+  async function stopLocalArchive(endTimeSeconds = segmentTimelineCursorRef.current) {
+    const archiveRecorder = archiveRecorderRef.current;
+    const finalization = archiveFinalizedRef.current;
+    if (archiveRecorder && archiveRecorder.state !== "inactive") archiveRecorder.stop();
+    if (finalization) await finalization;
+    archiveFinalizedRef.current = null;
+    const fileHandle = archiveFileHandleRef.current;
+    const completed = await fileHandle?.getFile();
+    if (!completed || !fileHandle) return null;
+
+    const partNumber = archivePartNumberRef.current;
+    const startTimeSeconds = archivePartStartedAtRef.current;
+    const durationSeconds = Math.max(0.1, endTimeSeconds - startTimeSeconds);
+    let part: LocalTrainingVideoPart;
+    try {
+      part = await rememberTrainingVideoPart({
+        trainingId,
+        partNumber,
+        startTimeSeconds,
+        durationSeconds,
+        fileName: completed.name,
+        file: completed,
+      }, fileHandle);
+    } catch {
+      part = {
+        id: `${trainingId}:${partNumber}`,
+        trainingId,
+        partNumber,
+        startTimeSeconds,
+        durationSeconds,
+        fileName: completed.name,
+        file: completed,
+        savedAt: Date.now(),
+      };
+    }
+    const previousUrl = localPartUrlsRef.current.get(part.id);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    localPartUrlsRef.current.set(part.id, URL.createObjectURL(completed));
+    setLocalParts((current) => [...current.filter((item) => item.partNumber !== part.partNumber), part].sort((a, b) => a.partNumber - b.partNumber));
+    archiveFileHandleRef.current = null;
+    setLocalArchiveName(null);
+    return part;
+  }
+
+  async function startRealtimePublisher(activeSession: LiveSessionRecord) {
+    closeWebRtcSession(publisherSessionRef.current);
+    publisherSessionRef.current = null;
+    if (!activeSession.publishUrl) return null;
+    if (!captureStreamRef.current) return "The camera stream is not available for realtime sharing.";
+    try {
+      const published = await publishCameraStream(captureStreamRef.current, activeSession.publishUrl);
+      publisherSessionRef.current = published;
+      published.peer.onconnectionstatechange = () => {
+        if (!["failed", "disconnected"].includes(published.peer.connectionState) || publisherSessionRef.current !== published) return;
+        setNotice("Realtime camera sharing was interrupted. Local recording and cloud replay are still running.");
+      };
+      return null;
+    } catch (error) {
+      return `${error instanceof Error ? error.message : "Realtime camera sharing could not start."} Local recording and cloud replay are still available.`;
+    }
+  }
+
+  async function startLive() {
+    const directory = archiveDirectoryRef.current || await chooseLocalRecordingFolder();
+    if (!directory) return;
+    if (!streamRef.current) {
+      await connectCamera();
+      if (!streamRef.current) return;
+    }
+    try {
+      const next = await apiFetch<LiveSessionRecord>(`/api/trainings/${trainingId}/live`, {
+        method: "POST",
+        body: JSON.stringify({
+          sourceType: "BROWSER_CAMERA",
+          enableRealtime: process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true",
+        }),
+      });
+      setSession(next);
+      sequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence + 1), 0);
+      fetchedSequenceRef.current = Math.max(...next.segments.map((segment) => segment.sequence), -1);
+      segmentTimelineCursorRef.current = Math.max(
+        getReplayEdge(next.segments.filter((segment) => segment.status === "READY")),
+        ...localParts.map((part) => part.startTimeSeconds + part.durationSeconds),
+        0,
+      );
+      segmentStartedAtClockRef.current = Date.now();
+      recordingRef.current = true;
+      setRecording(true);
+      setPaused(false);
+      setCameraProblem(null);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      try {
+        await startLocalArchive(directory, localParts.length + 1, segmentTimelineCursorRef.current);
+      } catch (archiveError) {
+        recordingRef.current = false;
+        setRecording(false);
+        await apiFetch(`/api/trainings/${trainingId}/live`, { method: "PATCH" }).catch(() => undefined);
+        setSession(null);
+        setNotice(archiveError instanceof Error ? archiveError.message : "The local recording file could not be created.");
+        return;
+      }
+      const exercise = await startExerciseAt(segmentTimelineCursorRef.current);
+      void recordNextSegment(next);
+      const realtimeWarning = await startRealtimePublisher(next);
+      setNotice(realtimeWarning
+        ? `Exercise ${exercise.number} started. A local copy is being saved as ${archiveFileNameRef.current}. ${realtimeWarning}`
+        : `Exercise ${exercise.number} started and the training is now shared with the staff.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The live session could not be started.");
+    }
+  }
+
+  async function recordNextSegment(activeSession: LiveSessionRecord) {
+    if (!recordingRef.current || !captureStreamRef.current) return;
+    const sequence = sequenceRef.current++;
+    const startedAtSeconds = segmentTimelineCursorRef.current;
+    segmentStartedAtClockRef.current = Date.now();
+    const mimeType = supportedSegmentMimeType();
+    const captureProfile = captureProfiles[captureMode];
+    setCaptureDiagnostics((current) => ({ ...current, replayMimeType: mimeType }));
+    const cloudReplayEnabled = process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true" && shouldUploadReplayFromOrigin(window.location);
+    const preparation = cloudReplayEnabled
+      ? apiFetch<PreparedSegment>(`/api/live-sessions/${activeSession.id}/segments`, {
+          method: "POST",
+          body: JSON.stringify({ sequence, startedAtSeconds, mimeType }),
+        }).then((prepared) => ({ prepared, error: null })).catch((error: unknown) => ({ prepared: null, error }))
+      : Promise.resolve({ prepared: null, error: null });
+    const chunks: BlobPart[] = [];
+    const recorder = new MediaRecorder(captureStreamRef.current, {
+      mimeType,
+      videoBitsPerSecond: captureProfile.replayVideoBitsPerSecond,
+      audioBitsPerSecond: 96_000,
+    });
+    recorderRef.current = recorder;
+    const startedAt = performance.now();
+    recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+    recorder.onerror = (event) => {
+      const recorderError = (event as Event & { error?: DOMException }).error;
+      const message = recorderError?.message || "The replay recorder reported an error.";
+      setCaptureDiagnostics((current) => ({ ...current, lastEvent: `Replay recorder error: ${message}` }));
+      void handleCameraLoss(message);
+    };
+    recorder.onstop = () => {
+      const durationSeconds = Math.max(0.1, (performance.now() - startedAt) / 1000);
+      segmentTimelineCursorRef.current = Math.max(segmentTimelineCursorRef.current, startedAtSeconds + durationSeconds);
+      segmentStartedAtClockRef.current = 0;
+      const blob = new Blob(chunks, { type: mimeType });
+      if (blob.size) {
+        localReplaySegmentsRef.current.set(sequence, {
+          sequence,
+          startedAtSeconds,
+          durationSeconds,
+          mimeType,
+          blob,
+        });
+      }
+      // Begin the next independent recording immediately. Preparing and uploading
+      // this completed segment must never introduce a gap in the camera capture.
+      if (recordingRef.current) void recordNextSegment(activeSession);
+      const upload = preparation.then(async ({ prepared, error }) => {
+        if (!blob.size) throw new Error(`Recording segment ${sequence + 1} contains no video data.`);
+        const localId = prepared?.id || `local-${activeSession.id}-${sequence}`;
+        const localPlaybackUrl = URL.createObjectURL(blob);
+        const previousUrl = localSegmentUrlsRef.current.get(sequence);
+        if (previousUrl) URL.revokeObjectURL(previousUrl);
+        localSegmentUrlsRef.current.set(sequence, localPlaybackUrl);
+        const localSegment: LiveSegmentRecord = {
+          id: localId,
+          sequence,
+          startedAtSeconds,
+          durationSeconds,
+          mimeType,
+          fileSize: String(blob.size),
+          status: "READY",
+          readyAt: new Date().toISOString(),
+          playbackUrl: localPlaybackUrl,
+          playbackUrlExpiresAt: null,
+        };
+        setSession((current) => current && current.id === activeSession.id
+          ? { ...current, segments: [...current.segments.filter((segment) => segment.sequence !== sequence), localSegment].sort((a, b) => a.sequence - b.sequence) }
+          : current);
+        if (!prepared) {
+          if (error) throw error instanceof Error ? error : new Error(`Cloud replay segment ${sequence + 1} could not be prepared.`);
+          return;
+        }
+        try {
+          const saved = await uploadSegment(activeSession.id, prepared, blob, durationSeconds);
+          setSession((current) => current && current.id === activeSession.id
+            ? { ...current, segments: [...current.segments.filter((segment) => segment.sequence !== sequence), saved].sort((a, b) => a.sequence - b.sequence) }
+            : current);
+          window.setTimeout(() => {
+            if (localSegmentUrlsRef.current.get(sequence) !== localPlaybackUrl) return;
+            URL.revokeObjectURL(localPlaybackUrl);
+            localSegmentUrlsRef.current.delete(sequence);
+          }, 1_000);
+        } catch (uploadError) {
+          await apiFetch(`/api/live-sessions/${activeSession.id}/segments/${prepared.id}`, { method: "DELETE" }).catch(() => undefined);
+          throw uploadError;
+        }
+      }).catch((error) => {
+        console.warn(`Cloud replay segment ${sequence + 1} was not uploaded. Local replay and recording continue.`, error);
+      });
+      pendingUploadsRef.current.add(upload);
+      void upload.finally(() => pendingUploadsRef.current.delete(upload));
+    };
+    recorder.start();
+    recorderTimerRef.current = window.setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, captureProfile.segmentMilliseconds);
+  }
+
+  async function uploadSegment(liveSessionId: string, prepared: PreparedSegment, blob: Blob, durationSeconds: number) {
+    if (!blob.size) throw new Error(`Recording segment ${prepared.sequence + 1} contains no video data.`);
+    const response = await fetch(prepared.uploadUrl, { method: "PUT", headers: { "Content-Type": blob.type }, body: blob });
+    if (!response.ok) throw new Error(`Recording segment ${prepared.sequence + 1} could not be stored.`);
+    const saved = await apiFetch<LiveSegmentRecord>(`/api/live-sessions/${liveSessionId}/segments/${prepared.id}`, { method: "PATCH", body: JSON.stringify({ durationSeconds, fileSize: blob.size }) });
+    fetchedSequenceRef.current = Math.max(fetchedSequenceRef.current, saved.sequence);
+    return saved;
+  }
+
+  async function pauseRecording() {
+    if (!recording || pausing || stopping) return;
+    setPausing(true);
+    recordingRef.current = false;
+    setRecording(false);
+    if (recorderTimerRef.current !== null) {
+      window.clearTimeout(recorderTimerRef.current);
+      recorderTimerRef.current = null;
+    }
+    try {
+      const segmentRecorder = recorderRef.current;
+      if (segmentRecorder?.state === "recording") {
+        await new Promise<void>((resolve) => {
+          segmentRecorder.addEventListener("stop", () => resolve(), { once: true });
+          segmentRecorder.stop();
+        });
+      }
+      closeWebRtcSession(publisherSessionRef.current);
+      publisherSessionRef.current = null;
+      const completedPart = await stopLocalArchive(segmentTimelineCursorRef.current);
+      if (!completedPart) throw new Error("The exercise recording could not be finalized.");
+      const exercise = await endExerciseAt(segmentTimelineCursorRef.current);
+      stopCameraStreams();
+      setCameraConnected(false);
+      setPaused(true);
+      setAtLiveEdge(false);
+      setPlayheadSeconds(completedPart.startTimeSeconds);
+      setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+      setNotice(`Exercise ${exercise.number} ended and was saved as ${completedPart.fileName}. All tagged clips remain available.`);
+    } catch (error) {
+      recordingRef.current = false;
+      setRecording(false);
+      setPaused(Boolean(localParts.length || archiveFileHandleRef.current === null));
+      setNotice(error instanceof Error ? error.message : "The exercise recording could not be finalized.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function resumeRecording() {
+    if (!paused || !session || pausing || stopping) return;
+    const directory = archiveDirectoryRef.current || await chooseLocalRecordingFolder();
+    if (!directory) return;
+    if (!streamRef.current) await connectCamera();
+    if (!streamRef.current) return;
+    try {
+      const partNumber = localParts.length + 1;
+      await startLocalArchive(directory, partNumber, segmentTimelineCursorRef.current);
+      recordingRef.current = true;
+      segmentStartedAtClockRef.current = Date.now();
+      setRecording(true);
+      setPaused(false);
+      setCameraProblem(null);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      const exercise = await startExerciseAt(segmentTimelineCursorRef.current);
+      void recordNextSegment(session);
+      const realtimeWarning = await startRealtimePublisher(session);
+      setNotice(realtimeWarning
+        ? `Exercise ${exercise.number} started at ${formatTime(segmentTimelineCursorRef.current)}. ${realtimeWarning}`
+        : `Exercise ${exercise.number} started at ${formatTime(segmentTimelineCursorRef.current)}.`);
+    } catch (error) {
+      recordingRef.current = false;
+      setRecording(false);
+      setNotice(error instanceof Error ? error.message : "The next exercise could not be started.");
+    }
+  }
+
+  async function stopLive() {
+    setStopping(true);
+    recordingRef.current = false;
+    setRecording(false);
+    setPaused(false);
+    if (recorderTimerRef.current !== null) window.clearTimeout(recorderTimerRef.current);
+    const recorder = recorderRef.current;
+    if (recorder?.state === "recording") await new Promise<void>((resolve) => { recorder.addEventListener("stop", () => resolve(), { once: true }); recorder.stop(); });
+    closeWebRtcSession(publisherSessionRef.current);
+    publisherSessionRef.current = null;
+    const finalizationResults = await Promise.allSettled([stopLocalArchive(segmentTimelineCursorRef.current), ...pendingUploadsRef.current]);
+    if (currentExercise) await endExerciseAt(segmentTimelineCursorRef.current).catch(() => undefined);
+    stopCameraStreams();
+    setCameraConnected(false);
+    try {
+      const ended = await apiFetch<LiveSessionRecord>(`/api/trainings/${trainingId}/live`, { method: "PATCH" });
+      setSession(ended);
+      setAtLiveEdge(false);
+      const latest = ended.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).at(-1);
+      if (latest) openSegment(latest, 0, false, false);
+      const localFailed = finalizationResults[0]?.status === "rejected";
+      const completedPart = finalizationResults[0]?.status === "fulfilled" ? finalizationResults[0].value : null;
+      const lastPartNumber = completedPart?.partNumber || localParts.at(-1)?.partNumber || 0;
+      if (completedPart) {
+        setReplayTarget({ segmentId: `local-part-${completedPart.id}`, offsetSeconds: 0, autoplay: false, command: ++replayCommandRef.current });
+        setPlayheadSeconds(completedPart.startTimeSeconds);
+      }
+      setNotice(localFailed
+        ? "The training ended, but the current exercise file could not be finalized. Previously completed exercises remain available."
+        : `The training ended. ${Math.max(lastPartNumber, localParts.length)} exercise recording${Math.max(lastPartNumber, localParts.length) === 1 ? "" : "s"} saved.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The live session could not be stopped cleanly.");
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  function advanceReplay() {
+    if (!selectedSegment) return;
+    const next = readySegments[readySegments.findIndex((segment) => segment.id === selectedSegment.id) + 1];
+    if (next) return openSegment(next, 0, true, atLiveEdge);
+    setPlaying(false);
+  }
+
+  function handleReplayTimeUpdate(video: HTMLVideoElement) {
+    if (!selectedSegment) return;
+    const virtualTime = selectedSegment.startedAtSeconds + video.currentTime;
+    setPlayheadSeconds(virtualTime);
+    if (previewEnd !== null && virtualTime >= previewEnd - 0.04) {
+      video.pause();
+      setPlayheadSeconds(previewEnd);
+      setPreviewEnd(null);
+    }
+  }
+
+  function seekBy(seconds: number) {
+    setPreviewEnd(null);
+    void seekVirtual(currentTime + seconds, atLiveEdge || playing);
+  }
+
+  function goToExactTime() {
+    const seconds = Number(seekTime);
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > availableEdgeSeconds) return setNotice(`Enter a second between 0 and ${formatTime(availableEdgeSeconds)}.`);
+    setPreviewEnd(null);
+    void seekVirtual(seconds, true);
+  }
+
+  function setRate(rate: number) {
+    setPlaybackRate(rate);
+    if (replayVideoRef.current) replayVideoRef.current.playbackRate = rate;
+  }
+
+  function reviewMoment(moment: MomentRecord) {
+    setSelectedMomentId(moment.id);
+    setPreviewEnd(moment.endTimeSeconds);
+    const sources: TimedVideoSource[] = readySegments
+      .filter((segment) => segment.playbackUrl && segment.durationSeconds)
+      .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
+    const complete = planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete;
+    setPendingMomentReviewId(complete ? null : moment.id);
+    if (!seekVirtual(moment.startTimeSeconds, true)) {
+      setNotice("Finalizing this clip on the phone. It will open automatically when ready.");
+    } else if (!complete) {
+      setNotice("The available exercise recording is playing while the final seconds finish uploading. The complete clip will restart automatically.");
+    }
+  }
+
+  function localReplaySegmentsForMoment(moment: MomentRecord) {
+    const segments = [...localReplaySegmentsRef.current.values()].sort((a, b) => a.startedAtSeconds - b.startedAtSeconds);
+    const sources: TimedVideoSource[] = segments.map((segment) => ({
+      sourceUrl: String(segment.sequence),
+      startedAtSeconds: segment.startedAtSeconds,
+      durationSeconds: segment.durationSeconds,
+    }));
+    const plan = planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds);
+    if (!plan.complete) return null;
+    const usedSequences = new Set(plan.slices.map((slice) => Number(slice.sourceUrl)));
+    return segments.filter((segment) => usedSequences.has(segment.sequence));
+  }
+
+  async function waitForLocalReplaySegments(moment: MomentRecord) {
+    let available = localReplaySegmentsForMoment(moment);
+    if (available) return available;
+
+    setNotice("Finishing the replay buffer for this clip. The main recording is continuing...");
+    if (recordingRef.current && recorderRef.current?.state === "recording") {
+      if (recorderTimerRef.current !== null) {
+        window.clearTimeout(recorderTimerRef.current);
+        recorderTimerRef.current = null;
+      }
+      recorderRef.current.stop();
+    }
+
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+      available = localReplaySegmentsForMoment(moment);
+      if (available) return available;
+    }
+
+    throw new Error("The complete moment is not available in this computer's replay buffer yet.");
+  }
+
+  function cloudReplaySegmentsForMoment(moment: MomentRecord, segments = readySegments) {
+    const sources: TimedVideoSource[] = segments.flatMap((segment) => segment.playbackUrl && segment.durationSeconds
+      ? [{ sourceUrl: segment.playbackUrl, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds }]
+      : []);
+    return planSegmentedMomentExport(sources, moment.startTimeSeconds, moment.endTimeSeconds).complete ? sources : null;
+  }
+
+  async function waitForCloudReplaySegments(moment: MomentRecord) {
+    let available = cloudReplaySegmentsForMoment(moment);
+    if (available) return available;
+    if (!session) throw new Error("This live session is no longer available.");
+    setNotice("Finalizing the clip on the phone and loading it from the shared replay…");
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 800));
+      const latest = await apiFetch<LiveSessionRecord>(`/api/live-sessions/${session.id}`);
+      applySession(latest);
+      const cloudSegments = latest.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl);
+      available = cloudReplaySegmentsForMoment(moment, cloudSegments);
+      if (available) return available;
+    }
+    throw new Error("The phone did not finish uploading the complete clip. Check the replay upload warning on the phone and the R2 CORS domain.");
+  }
+
+  async function exportMoment(moment: MomentRecord) {
+    if (!training || exportingMomentId) return;
+    setExportingMomentId(moment.id);
+    const part = localParts.find((item) => moment.startTimeSeconds >= item.startTimeSeconds - 0.05 && moment.endTimeSeconds <= item.startTimeSeconds + item.durationSeconds + 0.05);
+    try {
+      if (part) {
+        const localMoment = {
+          ...moment,
+          startTimeSeconds: Math.max(0, moment.startTimeSeconds - part.startTimeSeconds),
+          endTimeSeconds: Math.max(0.1, moment.endTimeSeconds - part.startTimeSeconds),
+        };
+        const fallbackUrl = localPartUrlsRef.current.get(part.id) || URL.createObjectURL(part.file);
+        const ownsFallbackUrl = !localPartUrlsRef.current.has(part.id);
+        const exporter = new SmartVideoExportSession(part.file);
+        setNotice(`Preparing ${moment.momentType.name} for export...`);
+        try {
+          const result = await exporter.exportMoment({
+            training,
+            moment: localMoment,
+            quality: "high",
+            sourceUrlFallback: fallbackUrl,
+            onStatus: (message) => setNotice(message),
+          });
+          downloadBlob(result.blob, result.fileName);
+        } finally {
+          exporter.dispose();
+          if (ownsFallbackUrl) URL.revokeObjectURL(fallbackUrl);
+        }
+      } else {
+        const useLocalReplay = recordingRef.current || localReplaySegmentsRef.current.size > 0;
+        if (useLocalReplay) {
+          const replaySegments = await waitForLocalReplaySegments(moment);
+          const temporaryUrls = replaySegments.map((segment) => ({ url: URL.createObjectURL(segment.blob), segment }));
+          try {
+            const result = await exportSegmentedMomentClip({
+              sources: temporaryUrls.map(({ url, segment }) => ({
+                sourceUrl: url,
+                startedAtSeconds: segment.startedAtSeconds,
+                durationSeconds: segment.durationSeconds,
+              })),
+              training,
+              moment,
+              quality: "standard",
+              onStatus: (message) => setNotice(message),
+            });
+            downloadBlob(result.blob, result.fileName);
+          } finally {
+            temporaryUrls.forEach(({ url }) => URL.revokeObjectURL(url));
+          }
+        } else {
+          const cloudSources = await waitForCloudReplaySegments(moment);
+          const result = await exportSegmentedMomentClip({
+            sources: cloudSources,
+            training,
+            moment,
+            quality: "standard",
+            onStatus: (message) => setNotice(message),
+          });
+          downloadBlob(result.blob, result.fileName);
+        }
+      }
+      setNotice(`${moment.momentType.name} exported successfully. The live recording continued throughout.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "This moment could not be exported.");
+    } finally {
+      setExportingMomentId(null);
+    }
+  }
+
+  async function updateMoment(input: Record<string, unknown>) {
+    if (!editingMoment) return;
+    try {
+      const saved = await apiFetch<MomentRecord>(`/api/moments/${editingMoment.id}`, { method: "PATCH", body: JSON.stringify(input) });
+      setTraining((current) => current ? { ...current, moments: current.moments.map((moment) => moment.id === saved.id ? saved : moment).sort((a, b) => a.startTimeSeconds - b.startTimeSeconds) } : current);
+      setEditingMoment(null);
+      setSelectedMomentId(saved.id);
+      setNotice("Moment updated.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not update the moment.");
+    }
+  }
+
+  async function toggleOutcome(moment: MomentRecord, outcome: "positive" | "negative") {
+    try {
+      const saved = await apiFetch<MomentRecord>(`/api/moments/${moment.id}`, { method: "PATCH", body: JSON.stringify({ outcome: moment.outcome === outcome ? null : outcome }) });
+      setTraining((current) => current ? { ...current, moments: current.moments.map((item) => item.id === saved.id ? saved : item) } : current);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not classify the moment.");
+    }
+  }
+
+  async function removeMoment(moment: MomentRecord, confirmRemoval = true) {
+    if (confirmRemoval && !confirm(`Delete ${moment.momentType.name}?`)) return;
+    try {
+      await apiFetch(`/api/moments/${moment.id}`, { method: "DELETE" });
+      setTraining((current) => {
+        if (!current) return current;
+        const moments = current.moments.filter((item) => item.id !== moment.id);
+        setSelectedMomentId((selected) => selected === moment.id ? moments[0]?.id || null : selected);
+        return { ...current, moments, momentCount: Math.max(0, current.momentCount - 1) };
+      });
+      setNotice(`${moment.momentType.name} deleted.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not delete the moment.");
+    }
+  }
+
+  async function saveTraining(input: Record<string, unknown>) {
+    const saved = await apiFetch<TrainingDetail>(`/api/trainings/${trainingId}`, { method: "PATCH", body: JSON.stringify(input) });
+    setTraining(saved);
+    setEditingTraining(false);
+    setNotice("Training updated.");
+  }
+
+  async function removeCurrentTraining() {
+    await apiFetch(`/api/trainings/${trainingId}`, { method: "DELETE" });
+    router.replace("/");
+    router.refresh();
+  }
+
+  if (loading) return <div className="flex min-h-[65vh] items-center justify-center text-slate-400"><Loader2 className="mr-2 animate-spin" />Preparing Live Training…</div>;
+  if (!training || !settings) return <Panel className="border-red-400/20 p-5 text-red-100">{notice || "This training could not be opened."}</Panel>;
+
+  const timelineDuration = Math.max(1, liveEdgeSeconds, ...training.moments.map((moment) => moment.endTimeSeconds));
+  const canReplay = readySegments.length > 0;
+  const behindLive = activeLive ? Math.max(0, liveEdgeSeconds - currentTime) : 0;
+  const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
+  const captureDiagnosticSummary = [
+    captureProfiles[captureMode].label,
+    `Rotation ${cameraRotation}°`,
+    captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "resolution pending",
+    captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)} fps` : "fps pending",
+    `MP4 ${codecLabel(captureDiagnostics.archiveMimeType)}`,
+    `Replay ${codecLabel(captureDiagnostics.replayMimeType)}`,
+    `${captureDiagnostics.reconnections} reconnect${captureDiagnostics.reconnections === 1 ? "" : "s"}`,
+    captureDiagnostics.lastEvent,
+  ].join(" · ");
+
+  return <div className="flex min-h-0 flex-col gap-2 xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden">
+    <Panel className="flex shrink-0 flex-wrap items-stretch overflow-hidden xl:grid xl:grid-cols-[auto_minmax(0,1fr)_auto]">
+      <div className="flex shrink-0 items-center gap-1 border-r border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-r-0">
+        <Link href="/" title="Trainings" aria-label="Trainings" className="inline-flex h-8 items-center gap-1 rounded-md px-1.5 text-[10px] font-semibold text-slate-400 hover:bg-white/[.06] hover:text-white"><ArrowLeft size={12} /><span className="hidden 2xl:inline">Trainings</span></Link>
+        <Badge className="max-w-36 truncate border-cyan-300/25 bg-cyan-300/10 text-[10px] text-cyan-100" title={training.title}>Live: {training.title}</Badge>
+        <button type="button" title="Edit training" aria-label="Edit training" onClick={() => setEditingTraining(true)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Settings2 size={13} /></button>
+      </div>
+      <div className="order-3 grid w-full min-w-0 grid-cols-2 gap-1.5 px-2 py-1.5 sm:grid-cols-3 lg:grid-cols-6 xl:order-none xl:flex xl:w-auto xl:items-center" aria-label="Tag the previous 20 seconds">
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
+      </div>
+      <div className="ml-auto flex min-w-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0 max-xl:flex-1">
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-24 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={recording || pausing || stopping}>
+          <option value="standard">Standard</option>
+          <option value="compatibility">Compatibility 720p</option>
+        </Select>
+        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
+        {cameraConnected || captureDiagnostics.reconnections > 0 ? <Badge className="hidden max-w-40 truncate border-cyan-300/20 bg-cyan-300/[.07] text-[9px] text-cyan-100 2xl:inline-flex" title={captureDiagnosticSummary}><Activity size={11} />{captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : captureProfiles[captureMode].label} · {captureDiagnostics.reconnections}R</Badge> : null}
+        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} exercise{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
+        <Button
+          size="icon"
+          className="h-8 w-8"
+          title={recording ? "Preserve this exercise before reconnecting the camera" : paused ? "Reconnect the camera and continue recording" : cameraConnected ? "Reconnect camera" : "Connect camera"}
+          onClick={() => recording
+            ? void handleCameraLoss("Camera reconnection requested.")
+            : paused && activeLive
+              ? void resumeRecording()
+              : void connectCamera()}
+          disabled={pausing || stopping}
+        ><Camera size={13} /></Button>
+        <Button size="icon" className="h-8 w-8" title="Connect a wireless phone camera" aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={recording || stopping}><Smartphone size={13} /></Button>
+        {!activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />Start exercise</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start exercise</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End training</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving exercise…" : "Start exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End training</Button></>}
+      </div>
+    </Panel>
+
+    {cameraProblem ? <div role="alert" className="flex shrink-0 flex-col gap-3 rounded-xl border border-amber-300/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50 sm:flex-row sm:items-center">
+      <AlertTriangle size={18} className="shrink-0 text-amber-300" />
+      <span className="min-w-0 flex-1"><span className="block">{cameraProblem}</span><span className="mt-1 block text-[10px] text-amber-100/60">{captureDiagnosticSummary}</span></span>
+      <Button
+        size="sm"
+        variant="primary"
+        className="shrink-0"
+        disabled={pausing || stopping}
+        onClick={() => paused && activeLive ? void resumeRecording() : void connectCamera()}
+      ><Camera size={14} />{pausing ? "Saving current exercise…" : paused && activeLive ? "Reconnect & continue" : "Reconnect camera"}</Button>
+    </div> : null}
+
+    {notice ? <div role="status" aria-live="polite" className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-3 rounded-xl border border-cyan-300/25 bg-pitch-950/95 px-4 py-3 text-sm text-cyan-50 shadow-2xl backdrop-blur-xl"><span className="min-w-0 flex-1">{notice}</span><button type="button" aria-label="Dismiss message" onClick={() => setNotice(null)} className="shrink-0 text-cyan-200/70 transition hover:text-white"><X size={15} /></button></div> : null}
+
+    <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[16rem_minmax(0,1fr)_16rem]">
+      <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
+        <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
+          {atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{paused ? "Exercise recording saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the training camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{paused ? "Select a tagged moment to review it, or start the next exercise." : "Recording continues while you independently control replay."}</p></div>}
+          {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
+          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "BETWEEN EXERCISES" : `● EXERCISE ${currentExercise?.number ?? ""}`}</span> : null}
+          {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
+          {atLiveEdge && cameraConnected ? <span className="absolute bottom-3 left-3 max-w-[calc(100%-1.5rem)] truncate rounded-md border border-white/10 bg-slate-950/75 px-2 py-1 font-mono text-[9px] text-slate-300 backdrop-blur-sm" title={captureDiagnosticSummary}><Activity size={10} className="mr-1 inline text-cyan-300" />{captureProfiles[captureMode].label} · {captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "detecting"} · {captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)}fps` : "fps—"} · {captureDiagnostics.reconnections}R</span> : null}
+        </div>
+        <div className="shrink-0 border-t border-white/10 bg-pitch-950/90 p-2">
+          <input aria-label="Live recording position" type="range" min={0} max={Math.max(availableEdgeSeconds, 0.1)} step={0.1} value={Math.min(currentTime, availableEdgeSeconds)} disabled={!canReplay} onChange={(event) => { setPreviewEnd(null); void seekVirtual(Number(event.target.value), atLiveEdge || playing); }} className="h-1.5 w-full cursor-pointer accent-cyan-300 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: availableEdgeSeconds ? `linear-gradient(to right, #67e8f9 ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%, rgba(255,255,255,.14) ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%)` : undefined }} />
+          <div className="mt-1.5 flex items-center gap-2">
+            <div className="min-w-0 flex-1 overflow-x-auto"><div className="flex min-w-max items-center gap-1">
+              <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Back 15 seconds" onClick={() => seekBy(-15)}><ChevronsLeft size={15} /></Button>
+              <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Back 5 seconds (left arrow)" onClick={() => seekBy(-5)}><RotateCcw size={15} /></Button>
+              <Button size="icon" className="h-8 w-8" variant="primary" disabled={!canReplay && !showingRemoteLive} title="Play or pause (space)" onClick={togglePlayback}>{playing && !(atLiveEdge && cameraConnected) ? <Pause size={15} /> : <Play size={15} />}</Button>
+              <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 5 seconds (right arrow)" onClick={() => seekBy(5)}><ChevronsRight size={15} /></Button>
+              <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 15 seconds" onClick={() => seekBy(15)}><ChevronsRight size={15} className="scale-125" /></Button>
+              <div className="flex overflow-hidden rounded-md border border-white/10">{[1, 2, 4].map((rate) => <button key={rate} type="button" onClick={() => setRate(rate)} className={`h-8 px-2 text-[10px] font-semibold transition ${playbackRate === rate ? "bg-cyan-300 text-slate-950" : "bg-white/[.04] text-slate-300 hover:bg-white/[.1]"}`}>{rate}×</button>)}</div>
+              <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" disabled={!activeLive} onClick={goLive}><Radio size={12} />Go Live</Button>
+              <Button size="icon" variant="danger" className="h-8 w-8" disabled={!lastMoment} title={lastMoment ? `Delete last recorded moment: ${lastMoment.momentType.name}` : "No recorded moment to delete"} onClick={() => lastMoment && void removeMoment(lastMoment, false)}><Trash2 size={14} /></Button>
+              <div className="ml-1 flex h-8 items-center gap-2 rounded-md border border-emerald-300/25 bg-emerald-300/10 px-2 text-[10px] text-emerald-100"><Dumbbell size={12} />{currentExercise ? `Exercise ${currentExercise.number} active` : `${training.exercises.length} exercises saved`}</div>
+              <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={availableEdgeSeconds || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!canReplay} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" disabled={!canReplay || seekTime === ""}>Go</Button></form>
+            </div></div>
+            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(liveEdgeSeconds)}</span><Link href={`/analysis/${trainingId}`} className="inline-flex h-8 items-center gap-1 rounded-md bg-cyan-300 px-2 text-[10px] font-medium text-slate-950 transition hover:bg-cyan-200">Review recording <ChevronsRight size={13} /></Link></div>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
+        <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{training.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{training.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : training.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${moment.momentType.name}`} title="Download this moment as MP4 without stopping the recording">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
+      </Panel>
+
+      <Panel className="order-3 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
+        <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Players</p><p className="mt-1 text-xs text-slate-400">Click a name to save the previous 15 seconds</p></div><Badge><UserRound size={11} className="mr-1" />{training.participants.length}</Badge></div></div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">{training.participants.length === 0 ? <p className="p-3 text-xs text-slate-500">No players were selected for this training.</p> : training.participants.map(({ player }) => { const busy = busyPlayerId === player.id; const count = training.playerActions.filter((action) => action.playerId === player.id).length; const unavailable = !activeLive || paused || (!recording && !remoteLiveStream); return <button key={player.id} type="button" disabled={unavailable || busyPlayerId !== null} onClick={() => void markPlayerAction(player.id)} title={`${player.name}: save the previous 15 seconds`} className="mb-1 flex h-9 w-full items-center gap-2 rounded-md border border-white/10 bg-white/[.035] px-2 text-left transition hover:border-cyan-300/30 hover:bg-cyan-300/10 disabled:opacity-40"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-black/25 font-mono text-[9px] text-cyan-100">{player.shirtNumber ?? "—"}</span><span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">{player.name}</span><span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-white/[.07] px-1 text-[9px] text-slate-400">{busy ? "…" : count}</span></button>; })}</div>
+        <div className="shrink-0 border-t border-white/10 px-3 py-2 text-[9px] text-slate-500">{training.playerActionCount} individual actions saved</div>
+      </Panel>
+    </div>
+
+    <Timeline momentTypes={settings.momentTypes} moments={training.moments} duration={timelineDuration} selectedMomentId={selectedMomentId} onSelect={reviewMoment} />
+    {editingMoment ? <MomentEditDialog moment={editingMoment} momentTypes={settings.momentTypes} duration={timelineDuration} onSave={updateMoment} onClose={() => setEditingMoment(null)} /> : null}
+    {editingTraining ? <TrainingEditDialog training={training} onSave={saveTraining} onDelete={removeCurrentTraining} onClose={() => setEditingTraining(false)} /> : null}
+    {pairingPhone ? <PhoneCameraPairingDialog trainingId={trainingId} onClose={() => setPairingPhone(false)} /> : null}
+  </div>;
+}
+
+function Timeline({ momentTypes, moments, duration, selectedMomentId, onSelect }: { momentTypes: SettingsPayload["momentTypes"]; moments: MomentRecord[]; duration: number; selectedMomentId: string | null; onSelect: (moment: MomentRecord) => void }) {
+  const visibleTypes = useMemo(() => momentTypes.filter((type) => type.active || moments.some((moment) => moment.momentTypeId === type.id)), [momentTypes, moments]);
+  return <Panel className="flex shrink-0 flex-col overflow-hidden xl:h-24"><div className="flex shrink-0 items-center justify-between border-b border-white/10 px-2 py-1"><span className="text-[9px] font-semibold uppercase tracking-[.18em] text-slate-500">Timeline</span><span className="text-[9px] text-slate-500">Moments in the recording</span></div><div className="min-h-0 flex-1 overflow-auto bg-black/20"><div className="min-w-[720px] overflow-hidden">{visibleTypes.map((type) => <div key={type.id} className="grid min-h-6 grid-cols-[8rem_minmax(0,1fr)] border-b border-white/[.07] last:border-b-0"><div className="flex items-center gap-2 border-r border-white/[.07] px-2 py-1"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: type.color }} /><span className="truncate text-[9px] text-slate-300">{type.name}</span></div><div className="relative min-h-6"><div className="absolute inset-x-0 top-1/2 h-px bg-white/10" />{moments.filter((moment) => moment.momentTypeId === type.id).map((moment) => { const left = Math.max(0, Math.min(100, (moment.startTimeSeconds / duration) * 100)); const width = Math.max(0.6, Math.min(100 - left, ((moment.endTimeSeconds - moment.startTimeSeconds) / duration) * 100)); return <button key={moment.id} type="button" title={`${type.name}: ${formatTime(moment.startTimeSeconds)} – ${formatTime(moment.endTimeSeconds)}`} onClick={() => onSelect(moment)} className={`absolute top-1/2 h-2.5 -translate-y-1/2 rounded-full border border-white/20 transition hover:h-4 ${selectedMomentId === moment.id ? "h-4 ring-1 ring-white/50" : ""}`} style={{ left: `${left}%`, width: `${width}%`, backgroundColor: type.color }} />; })}</div></div>)}</div></div></Panel>;
+}

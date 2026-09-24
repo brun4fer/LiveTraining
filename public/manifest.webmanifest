@@ -1,0 +1,15 @@
+{
+  "name": "Live Training",
+  "short_name": "Live Training",
+  "start_url": "/",
+  "id": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "categories": ["sports", "productivity"],
+  "background_color": "#04100c",
+  "theme_color": "#0b281d",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
