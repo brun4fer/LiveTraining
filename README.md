@@ -39,6 +39,8 @@ Reports deliberately keep the two data sets independent:
 - **Training moments** shows collective moment types, exercise, time, and totals.
 - **Player actions** shows a compact count per player plus every independent action with its exercise and clip time.
 
+The report workspace supports selecting one or several trainings, filtering by collective moment or player, playing the filtered clips in sequence, exporting selected clips, and exporting the complete local or cloud recordings. Trainings recorded as separate exercise files are exported together in a training folder.
+
 Player actions are not children of moments and do not need a collective moment to exist.
 
 ## Video and storage
