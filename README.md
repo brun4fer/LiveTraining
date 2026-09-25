@@ -37,7 +37,7 @@ Only individual panels scroll when their content exceeds the available height; t
 Reports deliberately keep the two data sets independent:
 
 - **Training moments** shows collective moment types, exercise, time, and totals.
-- **Player actions** shows each player’s action count and contribution to the selected training.
+- **Player actions** shows a compact count per player plus every independent action with its exercise and clip time.
 
 Player actions are not children of moments and do not need a collective moment to exist.
 

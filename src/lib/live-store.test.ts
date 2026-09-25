@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { liveMomentWindow } from "./live-store";
+import { DEFAULT_PLAYER_LEAD_SECONDS, liveMomentWindow } from "./live-store";
 
 test("creates the default live moment from the previous 20 seconds", () => {
   assert.deepEqual(liveMomentWindow(125), { startTimeSeconds: 105, endTimeSeconds: 125, durationSeconds: 20 });
@@ -13,6 +13,10 @@ test("clamps a live moment to the beginning of the recording", () => {
 
 test("supports an adjusted lead time", () => {
   assert.deepEqual(liveMomentWindow(90, 35), { startTimeSeconds: 55, endTimeSeconds: 90, durationSeconds: 35 });
+});
+
+test("creates a player action from exactly the previous 15 seconds", () => {
+  assert.deepEqual(liveMomentWindow(50, DEFAULT_PLAYER_LEAD_SECONDS), { startTimeSeconds: 35, endTimeSeconds: 50, durationSeconds: 15 });
 });
 
 test("does not let a moment cross into the previous recording part", () => {
