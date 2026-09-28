@@ -46,6 +46,9 @@ const captureProfiles = {
 type PreparedSegment = { id: string; uploadUrl: string; sequence: number };
 type CaptureMode = keyof typeof captureProfiles;
 type CameraRotation = 0 | 90 | 180 | 270;
+type TaggedEntry =
+  | { kind: "moment"; id: string; startTimeSeconds: number; item: MomentRecord }
+  | { kind: "player"; id: string; startTimeSeconds: number; item: PlayerActionRecord };
 type CaptureDiagnostics = {
   width: number | null;
   height: number | null;
@@ -303,6 +306,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const [seekTime, setSeekTime] = useState("");
   const [previewEnd, setPreviewEnd] = useState<number | null>(null);
   const [selectedMomentId, setSelectedMomentId] = useState<string | null>(null);
+  const [selectedPlayerActionId, setSelectedPlayerActionId] = useState<string | null>(null);
   const [pendingMomentReviewId, setPendingMomentReviewId] = useState<string | null>(null);
   const [busyMomentTypeId, setBusyMomentTypeId] = useState<string | null>(null);
   const [busyPlayerId, setBusyPlayerId] = useState<string | null>(null);
@@ -627,7 +631,9 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
   useEffect(() => {
     if (!pendingMomentReviewId || !training) return;
-    const moment = training.moments.find((item) => item.id === pendingMomentReviewId);
+    const savedMoment = training.moments.find((item) => item.id === pendingMomentReviewId);
+    const savedAction = training.playerActions.find((item) => item.id === pendingMomentReviewId);
+    const moment = savedMoment || (savedAction ? playerActionAsMoment(savedAction) : null);
     if (!moment) return setPendingMomentReviewId(null);
     const sources: TimedVideoSource[] = readySegments
       .filter((segment) => segment.playbackUrl && segment.durationSeconds)
@@ -1415,6 +1421,17 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
   function reviewMoment(moment: MomentRecord) {
     setSelectedMomentId(moment.id);
+    setSelectedPlayerActionId(null);
+    reviewTaggedClip(moment);
+  }
+
+  function reviewPlayerAction(action: PlayerActionRecord) {
+    setSelectedPlayerActionId(action.id);
+    setSelectedMomentId(null);
+    reviewTaggedClip(playerActionAsMoment(action));
+  }
+
+  function reviewTaggedClip(moment: MomentRecord) {
     setPreviewEnd(moment.endTimeSeconds);
     const sources: TimedVideoSource[] = readySegments
       .filter((segment) => segment.playbackUrl && segment.durationSeconds)
@@ -1579,6 +1596,15 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     }
   }
 
+  async function togglePlayerActionOutcome(action: PlayerActionRecord, outcome: "positive" | "negative") {
+    try {
+      const saved = await apiFetch<PlayerActionRecord>(`/api/player-actions/${action.id}`, { method: "PATCH", body: JSON.stringify({ outcome: action.outcome === outcome ? null : outcome }) });
+      setTraining((current) => current ? { ...current, playerActions: current.playerActions.map((item) => item.id === saved.id ? saved : item) } : current);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not classify the player action.");
+    }
+  }
+
   async function removeMoment(moment: MomentRecord, confirmRemoval = true) {
     if (confirmRemoval && !confirm(`Delete ${moment.momentType.name}?`)) return;
     try {
@@ -1592,6 +1618,22 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
       setNotice(`${moment.momentType.name} deleted.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Could not delete the moment.");
+    }
+  }
+
+  async function removePlayerAction(action: PlayerActionRecord) {
+    if (!confirm(`Delete ${action.player.name}'s action?`)) return;
+    try {
+      await apiFetch(`/api/player-actions/${action.id}`, { method: "DELETE" });
+      setTraining((current) => {
+        if (!current) return current;
+        const playerActions = current.playerActions.filter((item) => item.id !== action.id);
+        setSelectedPlayerActionId((selected) => selected === action.id ? null : selected);
+        return { ...current, playerActions, playerActionCount: Math.max(0, current.playerActionCount - 1) };
+      });
+      setNotice(`${action.player.name}'s action deleted.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not delete the player action.");
     }
   }
 
@@ -1611,7 +1653,11 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   if (loading) return <div className="flex min-h-[65vh] items-center justify-center text-slate-400"><Loader2 className="mr-2 animate-spin" />Preparing Live Training…</div>;
   if (!training || !settings) return <Panel className="border-red-400/20 p-5 text-red-100">{notice || "This training could not be opened."}</Panel>;
 
-  const timelineDuration = Math.max(1, liveEdgeSeconds, ...training.moments.map((moment) => moment.endTimeSeconds));
+  const timelineDuration = Math.max(1, liveEdgeSeconds, ...training.moments.map((moment) => moment.endTimeSeconds), ...training.playerActions.map((action) => action.endTimeSeconds));
+  const taggedEntries: TaggedEntry[] = [
+    ...training.moments.map((item) => ({ kind: "moment" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
+    ...training.playerActions.map((item) => ({ kind: "player" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
+  ].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds || a.id.localeCompare(b.id));
   const canReplay = readySegments.length > 0;
   const behindLive = activeLive ? Math.max(0, liveEdgeSeconds - currentTime) : 0;
   const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
@@ -1625,6 +1671,38 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     `${captureDiagnostics.reconnections} reconnect${captureDiagnostics.reconnections === 1 ? "" : "s"}`,
     captureDiagnostics.lastEvent,
   ].join(" · ");
+
+  function renderTaggedMoment(moment: MomentRecord) {
+    return <div key={`moment-${moment.id}`} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}>
+      <button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}>
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} />
+        <span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span>
+        <span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span>
+      </button>
+      <button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button>
+      <button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button>
+      <button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${moment.momentType.name}`} title="Download this moment as MP4 without stopping the recording">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button>
+      <button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button>
+      <button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>
+      {moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}
+    </div>;
+  }
+
+  function renderTaggedPlayerAction(action: PlayerActionRecord) {
+    const exportMomentRecord = playerActionAsMoment(action);
+    return <div key={`player-${action.id}`} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedPlayerActionId === action.id ? "bg-white/10" : ""}`}>
+      <button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewPlayerAction(action)} title={`${action.player.name} · ${formatTime(action.startTimeSeconds)}${action.createdBy ? ` · ${action.createdBy.name}` : ""}`}>
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-white" />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium text-white">{action.player.shirtNumber !== null ? `${action.player.shirtNumber} · ` : ""}{action.player.name}</span>
+        <span className="shrink-0 font-mono text-[10px] text-slate-300">{formatTime(action.startTimeSeconds)}</span>
+      </button>
+      <button aria-label="Mark player action as positive" onClick={() => void togglePlayerActionOutcome(action, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${action.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button>
+      <button aria-label="Mark player action as negative" onClick={() => void togglePlayerActionOutcome(action, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${action.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button>
+      <button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-white/20 bg-white/10 text-white hover:bg-white/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(exportMomentRecord)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${action.player.name}`} title="Download this player action as MP4 without stopping the recording">{exportingMomentId === action.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button>
+      <button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removePlayerAction(action)}><Trash2 size={11} />Delete</button>
+      {action.notes ? <p className="w-full break-words rounded-sm border border-white/15 bg-white/[.06] px-1.5 py-0.5 text-[10px] leading-4 text-slate-200">{action.notes}</p> : null}
+    </div>;
+  }
 
   return <div className="flex min-h-0 flex-col gap-2 xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden">
     <Panel className="flex shrink-0 flex-wrap items-stretch overflow-hidden xl:grid xl:grid-cols-[auto_minmax(0,1fr)_auto]">
@@ -1705,8 +1783,8 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
       </Panel>
 
       <Panel className="order-1 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
-        <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged moments</p><p className="mt-1 text-xs text-slate-400">{training.moments.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500">Select a row to review it without stopping the recording.</p></div>
-        <div className="min-h-0 flex-1 overflow-y-auto">{training.moments.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments will appear here.</p> : training.moments.map((moment) => <div key={moment.id} className={`flex min-h-9 w-full flex-wrap items-start gap-1.5 border-b border-white/[.06] px-2.5 py-1 text-left transition hover:bg-white/[.06] ${selectedMomentId === moment.id ? "bg-cyan-300/10 text-cyan-100" : ""}`}><button type="button" className="flex min-w-0 flex-1 items-center gap-2" onClick={() => reviewMoment(moment)} title={`${moment.momentType.name} · ${formatTime(moment.startTimeSeconds)}${moment.createdBy ? ` · ${moment.createdBy.name}` : ""}`}><span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: moment.momentType.color }} /><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{moment.momentType.name}</span><span className="shrink-0 font-mono text-[10px] text-slate-500">{formatTime(moment.startTimeSeconds)}</span></button><button aria-label="Mark as positive" onClick={() => void toggleOutcome(moment, "positive")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "positive" ? "border-emerald-300 bg-emerald-400 text-emerald-950" : "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"}`}><Check size={11} /></button><button aria-label="Mark as negative" onClick={() => void toggleOutcome(moment, "negative")} className={`flex h-6 w-6 shrink-0 items-center justify-center rounded border ${moment.outcome === "negative" ? "border-red-300 bg-red-400 text-red-950" : "border-red-400/25 bg-red-400/10 text-red-300"}`}><X size={11} /></button><button type="button" className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-violet-300/25 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20 disabled:cursor-wait disabled:opacity-40" onClick={() => void exportMoment(moment)} disabled={Boolean(exportingMomentId)} aria-label={`Download ${moment.momentType.name}`} title="Download this moment as MP4 without stopping the recording">{exportingMomentId === moment.id ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-cyan-300/25 bg-cyan-300/10 px-1.5 text-[10px] text-cyan-100" onClick={() => setEditingMoment(moment)}><Pencil size={11} />Edit</button><button type="button" className="inline-flex h-6 items-center gap-1 rounded-md border border-red-400/30 bg-red-500/10 px-1.5 text-[10px] text-red-100" onClick={() => void removeMoment(moment)}><Trash2 size={11} />Delete</button>{moment.notes ? <p className="w-full break-words rounded-sm border border-amber-300/20 bg-amber-300/10 px-1.5 py-0.5 text-[10px] leading-4 text-amber-200">{moment.notes}</p> : null}</div>)}</div>
+        <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Tagged clips</p><p className="mt-1 text-xs text-slate-400">{taggedEntries.length} in the recording</p></div><Badge title={liveViewers.map((viewer) => `${viewer.user.name} · ${viewer.atLiveEdge ? "live" : "replay"}`).join("\n")}><Users size={11} className="mr-1" />{liveViewers.length || (account ? 1 : 0)}</Badge></div><p className="mt-2 text-[10px] leading-4 text-slate-500"><span className="text-slate-400">Coloured dots: moments</span> · <span className="font-medium text-white">White dots: player actions</span></p></div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{taggedEntries.length === 0 ? <p className="p-3 text-xs leading-5 text-slate-500">Tagged moments and player actions will appear here.</p> : taggedEntries.map((entry) => entry.kind === "moment" ? renderTaggedMoment(entry.item) : renderTaggedPlayerAction(entry.item))}</div>
       </Panel>
 
       <Panel className="order-3 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
@@ -1721,6 +1799,38 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     {editingTraining ? <TrainingEditDialog training={training} onSave={saveTraining} onDelete={removeCurrentTraining} onClose={() => setEditingTraining(false)} /> : null}
     {pairingPhone ? <PhoneCameraPairingDialog trainingId={trainingId} onClose={() => setPairingPhone(false)} /> : null}
   </div>;
+}
+
+function playerActionAsMoment(action: PlayerActionRecord): MomentRecord {
+  return {
+    id: action.id,
+    trainingId: action.trainingId,
+    momentTypeId: `player-${action.playerId}`,
+    exerciseId: action.exerciseId,
+    startTimeSeconds: action.startTimeSeconds,
+    endTimeSeconds: action.endTimeSeconds,
+    durationSeconds: action.durationSeconds,
+    notes: action.notes,
+    outcome: action.outcome,
+    createdByUserId: action.createdByUserId,
+    liveSessionId: action.liveSessionId,
+    markedAtSeconds: action.markedAtSeconds,
+    leadSeconds: action.leadSeconds,
+    capturedFromLive: action.capturedFromLive,
+    createdBy: action.createdBy,
+    createdAt: action.createdAt,
+    updatedAt: action.updatedAt,
+    momentType: {
+      id: `player-${action.playerId}`,
+      name: action.player.name,
+      code: action.player.shirtNumber !== null ? `P${action.player.shirtNumber}` : "PLAYER",
+      color: "#ffffff",
+      defaultShortcut: null,
+      sortOrder: 0,
+      active: true,
+    },
+    exercise: action.exercise,
+  };
 }
 
 function Timeline({ momentTypes, moments, duration, selectedMomentId, onSelect }: { momentTypes: SettingsPayload["momentTypes"]; moments: MomentRecord[]; duration: number; selectedMomentId: string | null; onSelect: (moment: MomentRecord) => void }) {
