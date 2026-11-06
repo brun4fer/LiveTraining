@@ -1,9 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Archive, CheckSquare, ChevronsRight, Download, FileVideo, Loader2, Pause, Play, RotateCcw, Square, Upload, X } from "lucide-react";
+import { Archive, CheckSquare, ChevronsRight, Download, FileVideo, Loader2, Pause, Pencil, Play, RotateCcw, Square, Trash2, Upload, X } from "lucide-react";
 
+import { MomentEditDialog } from "@/components/moment-edit-dialog";
+import { OutcomeButtons } from "@/components/outcome-buttons";
+import { PlayerActionEditDialog } from "@/components/player-action-edit-dialog";
 import { Badge, Button, Label, Panel, Select } from "@/components/ui";
+import { useSoundPreference, VideoAudioToggle } from "@/components/video-audio-toggle";
 import { useVideoKeyboardSeek, VideoFullscreenButton } from "@/components/video-controls";
 import type { AccountPayload, MomentRecord, PlayerActionRecord, SettingsPayload, TrainingDetail, TrainingSummary } from "@/lib/domain";
 import { isExportPickerCancellation, pickExportDirectory, writeBlobToDirectory, writeUrlToDirectory } from "@/lib/export-directory";
@@ -30,6 +34,7 @@ type ReportClip = {
   durationSeconds: number;
   exerciseNumber: number | null;
   moment: MomentRecord;
+  action: PlayerActionRecord | null;
 };
 
 type PlayingClip = {
@@ -61,6 +66,7 @@ export function ReportsClient() {
   const [quality, setQuality] = useState<ExportQuality>("high");
   const [selectedClipKeys, setSelectedClipKeys] = useState<string[]>([]);
   const [playing, setPlaying] = useState<PlayingClip | null>(null);
+  const [editingClip, setEditingClip] = useState<ReportClip | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
@@ -71,6 +77,11 @@ export function ReportsClient() {
   const [status, setStatus] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [teamName, setTeamName] = useState("Team");
+  const { soundEnabled, setSoundEnabled } = useSoundPreference();
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = !soundEnabled;
+  }, [playing, soundEnabled]);
 
   useEffect(() => {
     Promise.all([
@@ -131,6 +142,7 @@ export function ReportsClient() {
             durationSeconds: moment.durationSeconds,
             exerciseNumber: moment.exercise?.number ?? null,
             moment,
+            action: null,
           });
         }
       }
@@ -316,6 +328,42 @@ export function ReportsClient() {
     setNotice(unmatched.length ? `${matched} file(s) loaded. Could not match: ${unmatched.join(", ")}.` : `${matched} local video file(s) ready.`);
   }
 
+  async function updateReportClip(clip: ReportClip, input: Record<string, unknown>) {
+    if (clip.kind === "moment") {
+      const saved = await apiFetch<MomentRecord>(`/api/moments/${clip.id}`, { method: "PATCH", body: JSON.stringify(input) });
+      setDetails((current) => current.map((training) => training.id === clip.training.id ? { ...training, moments: training.moments.map((moment) => moment.id === saved.id ? saved : moment) } : training));
+    } else {
+      const saved = await apiFetch<PlayerActionRecord>(`/api/player-actions/${clip.id}`, { method: "PATCH", body: JSON.stringify(input) });
+      setDetails((current) => current.map((training) => training.id === clip.training.id ? { ...training, playerActions: training.playerActions.map((action) => action.id === saved.id ? saved : action) } : training));
+    }
+    setPlaying(null);
+    setEditingClip(null);
+  }
+
+  async function toggleReportOutcome(clip: ReportClip, outcome: "positive" | "negative") {
+    try {
+      await updateReportClip(clip, { outcome: clip.moment.outcome === outcome ? null : outcome });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not update the action result.");
+    }
+  }
+
+  async function removeReportClip(clip: ReportClip) {
+    if (!confirm(`Delete “${clip.label}” from ${clip.training.title}?`)) return;
+    try {
+      await apiFetch<void>(clip.kind === "moment" ? `/api/moments/${clip.id}` : `/api/player-actions/${clip.id}`, { method: "DELETE" });
+      setDetails((current) => current.map((training) => training.id === clip.training.id ? {
+        ...training,
+        moments: clip.kind === "moment" ? training.moments.filter((moment) => moment.id !== clip.id) : training.moments,
+        playerActions: clip.kind === "player" ? training.playerActions.filter((action) => action.id !== clip.id) : training.playerActions,
+      } : training));
+      setSelectedClipKeys((current) => current.filter((key) => key !== clip.key));
+      if (playing?.clip.key === clip.key) setPlaying(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not delete the clip.");
+    }
+  }
+
   async function exportSelectedClips() {
     if (!selectedClips.length || exporting) return;
     let directory = null;
@@ -345,6 +393,7 @@ export function ReportsClient() {
             training: clip.training,
             moment: resolved.moment,
             quality,
+            includeAudio: soundEnabled,
             sourceUrlFallback: fallbackUrl,
             onStatus: (message) => setStatus(`${completed} of ${selectedClips.length}: ${message}`),
           });
@@ -435,11 +484,12 @@ export function ReportsClient() {
     {notice ? <div className="flex shrink-0 items-center justify-between rounded-lg border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-xs text-cyan-50"><span>{notice}</span><button onClick={() => setNotice(null)}><X size={15} /></button></div> : null}
     {exporting ? <div className="flex shrink-0 items-center gap-2 rounded-lg border border-leaf-400/25 bg-leaf-400/10 px-3 py-2 text-xs text-emerald-100"><Loader2 size={15} className="animate-spin" />{status}</div> : null}
 
-    <Panel className="grid shrink-0 gap-2 p-3 md:grid-cols-2 xl:grid-cols-[10rem_1fr_1fr_11rem_auto]">
+    <Panel className="grid shrink-0 gap-2 p-3 md:grid-cols-2 xl:grid-cols-[10rem_1fr_1fr_11rem_auto_auto]">
       <label className="grid gap-1"><Label>Show</Label><Select value={kind} onChange={(event) => { const next = event.target.value as ClipKind; setKind(next); if (next === "moment") setPlayerId(""); if (next === "player") setMomentTypeId(""); }}><option value="all">All clips</option><option value="moment">Collective moments</option><option value="player">Player actions</option></Select></label>
       <label className="grid gap-1"><Label>Moment</Label><Select value={momentTypeId} onChange={(event) => { setMomentTypeId(event.target.value); setPlayerId(""); if (event.target.value) setKind("moment"); }}><option value="">All moments</option>{settings?.momentTypes.map((type) => <option key={type.id} value={type.id}>{type.name}</option>)}</Select></label>
       <label className="grid gap-1"><Label>Player</Label><Select value={playerId} onChange={(event) => { setPlayerId(event.target.value); setMomentTypeId(""); if (event.target.value) setKind("player"); }}><option value="">All players</option>{availablePlayers.map((player) => <option key={player.id} value={player.id}>{player.shirtNumber !== null ? `${player.shirtNumber} · ` : ""}{player.name}</option>)}</Select></label>
       <label className="grid gap-1"><Label>Export quality</Label><Select value={quality} onChange={(event) => setQuality(event.target.value as ExportQuality)}>{exportQualityOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</Select></label>
+      <div className="flex items-end"><VideoAudioToggle soundEnabled={soundEnabled} onChange={setSoundEnabled} /></div>
       <div className="flex items-end gap-2"><Metric label="Clips" value={clips.length} /><Metric label="Duration" value={formatTime(totalDuration)} /></div>
     </Panel>
 
@@ -455,10 +505,21 @@ export function ReportsClient() {
         <div ref={workspaceRef} data-video-workspace className={`reports-video-workspace grid min-h-0 flex-1 gap-2 ${playing ? "lg:grid-cols-[minmax(0,1fr)_22rem]" : ""}`}>
           {playing ? <Panel className="reports-video-panel flex min-h-0 flex-col overflow-hidden"><div className="reports-video-stage min-h-0 flex-1 bg-black"><video key={`${playing.url}-${playing.clip.key}`} ref={videoRef} src={playing.url} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onLoadedMetadata={(event) => { setVideoDuration(event.currentTarget.duration); setCurrentTime(playing.mediaStart); event.currentTarget.currentTime = playing.mediaStart; event.currentTarget.playbackRate = playbackRate; if (autoPlayRef.current) void event.currentTarget.play(); }} onTimeUpdate={(event) => { setCurrentTime(event.currentTarget.currentTime); finishClip(event.currentTarget); }} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} /></div><div className="shrink-0 border-t border-white/10 p-2"><input aria-label="Clip position" type="range" min={playing.mediaStart} max={Math.min(videoDuration || playing.mediaEnd, playing.mediaEnd)} step={0.1} value={Math.max(playing.mediaStart, Math.min(currentTime, playing.mediaEnd))} onChange={(event) => seekTo(Number(event.target.value))} className="h-1.5 w-full cursor-pointer accent-cyan-300"/><div className="mt-1.5 flex items-center gap-1"><span className="mr-auto font-mono text-[10px] text-slate-300">{formatTime(timelineTime)} / {formatTime(playing.clip.endTimeSeconds)}</span><Button size="icon" className="h-7 w-7" onClick={() => seekTo(currentTime - 5)}><RotateCcw size={12}/></Button><Button size="icon" className="h-7 w-7" variant="primary" onClick={togglePlayback}>{isPlaying ? <Pause size={12}/> : <Play size={12}/>}</Button><Button size="icon" className="h-7 w-7" onClick={() => seekTo(currentTime + 5)}><ChevronsRight size={12}/></Button>{[1, 2, 4].map((rate) => <button key={rate} onClick={() => setRate(rate)} className={`h-7 min-w-8 rounded border border-white/10 px-1 text-[9px] ${playbackRate === rate ? "bg-cyan-300 text-slate-950" : "bg-white/[.04] text-slate-300"}`}>{rate}x</button>)}<VideoFullscreenButton targetRef={workspaceRef}/></div></div><div className="shrink-0 border-t border-white/10 px-3 py-2"><p className="truncate text-xs font-semibold text-white">{playing.clip.training.title} <span className="font-normal text-slate-500">· {playing.clip.label} · Ex. {playing.clip.exerciseNumber ?? "—"}</span></p></div></Panel> : null}
 
-          <Panel className="reports-clip-list flex min-h-0 flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-white/10 p-2.5"><div><Label>Clips</Label><p className="mt-0.5 text-[9px] text-slate-500">Click a row to play · checkbox selects for export</p></div><Badge>{selectedClips.length}/{clips.length}</Badge></div><div className="min-h-0 flex-1 overflow-y-auto">{clips.length ? clips.map((clip, index) => <div key={clip.key} className={`flex h-10 items-center gap-2 border-b border-white/[.06] px-2 hover:bg-white/[.05] ${playing?.clip.key === clip.key ? "bg-leaf-400/10" : ""}`}><input type="checkbox" checked={selectedClipKeys.includes(clip.key)} onChange={() => toggleClip(clip.key)} aria-label={`Select clip ${index + 1}`} className="h-3.5 w-3.5 shrink-0 accent-cyan-300"/><button type="button" onClick={() => void playClip(clip)} className="flex min-w-0 flex-1 items-center gap-2 text-left"><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: clip.color }}/><span className="min-w-0 flex-1"><span className="block truncate text-[11px] font-semibold text-white">{clip.label}</span><span className="block truncate text-[9px] text-slate-500">{clip.training.title} · {clip.detail}</span></span><span className="shrink-0 text-[9px] text-slate-500">Ex. {clip.exerciseNumber ?? "—"}</span><span className="w-20 shrink-0 text-right font-mono text-[9px] text-slate-300">{formatTime(clip.startTimeSeconds)}–{formatTime(clip.endTimeSeconds)}</span><Play size={11} className="shrink-0 text-cyan-300"/></button></div>) : <div className="flex h-full min-h-40 items-center justify-center p-8 text-center text-xs text-slate-500"><div><FileVideo className="mx-auto mb-2"/><p>{selectedIds.length ? "No clips match the current filters." : "Select one or more trainings."}</p></div></div>}</div></Panel>
+          <Panel className="reports-clip-list flex min-h-0 flex-col overflow-hidden">
+            <div className="flex shrink-0 items-center justify-between border-b border-white/10 p-2.5"><div><Label>Clips</Label><p className="mt-0.5 text-[9px] text-slate-500">Click a row to play · checkbox selects for export</p></div><Badge>{selectedClips.length}/{clips.length}</Badge></div>
+            <div className="min-h-0 flex-1 overflow-y-auto">{clips.length ? clips.map((clip, index) => <div key={clip.key} className={`flex min-h-10 items-center gap-1 border-b border-white/[.06] px-2 py-1 hover:bg-white/[.05] ${playing?.clip.key === clip.key ? "bg-leaf-400/10" : ""}`}>
+              <input type="checkbox" checked={selectedClipKeys.includes(clip.key)} onChange={() => toggleClip(clip.key)} aria-label={`Select clip ${index + 1}`} className="h-3.5 w-3.5 shrink-0 accent-cyan-300"/>
+              <button type="button" onClick={() => void playClip(clip)} className="flex min-w-0 flex-1 items-center gap-2 text-left"><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: clip.color }}/><span className="min-w-0 flex-1"><span className="block truncate text-[11px] font-semibold text-white">{clip.label}</span><span className="block truncate text-[9px] text-slate-500">{clip.training.title} · {clip.detail}</span></span><span className="shrink-0 text-[9px] text-slate-500">Ex. {clip.exerciseNumber ?? "—"}</span><span className="w-20 shrink-0 text-right font-mono text-[9px] text-slate-300">{formatTime(clip.startTimeSeconds)}–{formatTime(clip.endTimeSeconds)}</span><Play size={11} className="shrink-0 text-cyan-300"/></button>
+              <OutcomeButtons compact value={clip.moment.outcome} onChange={(outcome) => void toggleReportOutcome(clip, outcome)} />
+              <Button size="icon" className="h-6 w-6 shrink-0" title="Edit clip" aria-label="Edit clip" onClick={() => setEditingClip(clip)}><Pencil size={11} /></Button>
+              <Button size="icon" variant="danger" className="h-6 w-6 shrink-0" title="Delete clip" aria-label="Delete clip" onClick={() => void removeReportClip(clip)}><Trash2 size={11} /></Button>
+            </div>) : <div className="flex h-full min-h-40 items-center justify-center p-8 text-center text-xs text-slate-500"><div><FileVideo className="mx-auto mb-2"/><p>{selectedIds.length ? "No clips match the current filters." : "Select one or more trainings."}</p></div></div>}</div>
+          </Panel>
         </div>
       </div>
     </div>
+    {editingClip?.kind === "moment" && settings ? <MomentEditDialog moment={editingClip.moment} momentTypes={settings.momentTypes} duration={editingClip.training.video?.durationSeconds || 0} onSave={(input) => updateReportClip(editingClip, input)} onClose={() => setEditingClip(null)} /> : null}
+    {editingClip?.kind === "player" && editingClip.action ? <PlayerActionEditDialog action={editingClip.action} duration={editingClip.training.video?.durationSeconds || 0} onSave={(input) => updateReportClip(editingClip, input)} onClose={() => setEditingClip(null)} /> : null}
   </div>;
 }
 
@@ -507,6 +568,7 @@ function playerActionClip(training: TrainingDetail, action: PlayerActionRecord):
     durationSeconds: action.durationSeconds,
     exerciseNumber: action.exercise?.number ?? null,
     moment,
+    action,
   };
 }
 

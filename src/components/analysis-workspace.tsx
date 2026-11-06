@@ -9,6 +9,7 @@ import { CloudVideoLibrary } from "@/components/cloud-video-library";
 import { TrainingEditDialog } from "@/components/training-edit-dialog";
 import { MomentEditDialog } from "@/components/moment-edit-dialog";
 import { Badge, Button, Label, Panel, Select } from "@/components/ui";
+import { useSoundPreference, VideoAudioToggle } from "@/components/video-audio-toggle";
 import { VideoFullscreenButton } from "@/components/video-controls";
 import type { AccountPayload, TrainingDetail, MomentRecord, MomentTypeRecord, PlayerActionRecord, SettingsPayload } from "@/lib/domain";
 import { isExportPickerCancellation, pickExportDirectory, writeBlobToDirectory } from "@/lib/export-directory";
@@ -61,6 +62,11 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
   const [loadingCloudLibrary, setLoadingCloudLibrary] = useState(false);
   const [cloudLibraryError, setCloudLibraryError] = useState<string | null>(null);
   const [attachingAssetId, setAttachingAssetId] = useState<string | null>(null);
+  const { soundEnabled, setSoundEnabled } = useSoundPreference();
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = !soundEnabled;
+  }, [soundEnabled, sourceUrl]);
 
   useEffect(() => {
     let active = true;
@@ -411,6 +417,7 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
           training,
           moment,
           quality: exportQuality,
+          includeAudio: soundEnabled,
           sourceUrlFallback: exportUrl,
           onStatus: (message) => setExportStatus(`${current} of ${moments.length}: ${message}`)
         });
@@ -490,6 +497,7 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
         training,
         moment: exportMoment,
         quality: "high",
+        includeAudio: soundEnabled,
         sourceUrlFallback: exportUrl,
         onStatus: (message) => setNotice(message),
       });
@@ -545,7 +553,7 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
               <Button size="sm" variant={activeExercise ? "danger" : "primary"} className="ml-1 h-8 border-l px-2 text-[10px]" disabled={!sourceUrl} onClick={() => void toggleExercise()}><Dumbbell size={12} />{activeExercise ? `End exercise ${activeExercise.number}` : "Start exercise"}</Button>
               <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={duration || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!sourceUrl} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" variant="secondary" disabled={!sourceUrl || seekTime === ""}>Go</Button></form>
             </div></div>
-            <div className="flex shrink-0 items-center gap-1"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(duration)}</span><VideoFullscreenButton targetRef={workspaceRef} /><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Upload size={12} />Upload video</Button><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void downloadFullVideo()} disabled={!training.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}Download full video</Button></div>
+            <div className="flex shrink-0 items-center gap-1"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(duration)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} /><VideoFullscreenButton targetRef={workspaceRef} /><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Upload size={12} />Upload video</Button><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void downloadFullVideo()} disabled={!training.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}Download full video</Button></div>
           </div>
         </div>
       </Panel>
