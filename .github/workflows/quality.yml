@@ -19,6 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run prisma:generate
+      - run: npm run media:generate
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
