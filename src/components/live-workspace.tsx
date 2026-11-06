@@ -64,6 +64,20 @@ type CaptureDiagnostics = {
   lastEvent: string;
 };
 type LiveViewer = { user: { id: string; name: string; username: string }; atLiveEdge: boolean; playbackPositionSeconds: number | null };
+type WirelessCameraStatus = {
+  paired: boolean;
+  online: boolean;
+  ready: boolean;
+  desiredBroadcasting: boolean;
+  broadcasting: boolean;
+  endRequested: boolean;
+  commandVersion: number;
+  acknowledgedVersion: number;
+  lastSeenAt: string | null;
+  broadcastStartedAt: string | null;
+  expiresAt: string | null;
+};
+type WirelessCameraCommandResult = WirelessCameraStatus & { session?: LiveSessionRecord };
 type ReplayTarget = { segmentId: string; offsetSeconds: number; autoplay: boolean; command: number };
 type LocalWritableFile = { write(data: Blob): Promise<void>; close(): Promise<void>; abort?(): Promise<void> };
 type LocalFileHandle = LocalVideoFileHandle & { createWritable(): Promise<LocalWritableFile> };
@@ -260,6 +274,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const archiveDirectoryRef = useRef<LocalDirectoryHandle | null>(null);
   const archivePartNumberRef = useRef(1);
   const archivePartStartedAtRef = useRef(0);
+  const wirelessPartStartedAtRef = useRef(0);
   const localSegmentUrlsRef = useRef(new Map<number, string>());
   const localReplaySegmentsRef = useRef(new Map<number, LocalReplaySegment>());
   const localPartUrlsRef = useRef(new Map<string, string>());
@@ -326,6 +341,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const [externalPlayerTime, setExternalPlayerTime] = useState(0);
   const [externalPlayerEdge, setExternalPlayerEdge] = useState(0);
   const [externalPlayerReady, setExternalPlayerReady] = useState(false);
+  const [wirelessCamera, setWirelessCamera] = useState<WirelessCameraStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
@@ -431,6 +447,24 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     return () => window.clearInterval(timer);
   }, [applySession, trainingId]);
 
+  useEffect(() => {
+    let stopped = false;
+    async function refreshWirelessCamera() {
+      try {
+        const status = await apiFetch<WirelessCameraStatus>(`/api/trainings/${trainingId}/camera-control`);
+        if (!stopped) setWirelessCamera(status);
+      } catch {
+        // Camera-control polling must not interrupt local capture or replay.
+      }
+    }
+    void refreshWirelessCamera();
+    const timer = window.setInterval(() => void refreshWirelessCamera(), 1_500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [trainingId]);
+
   useEffect(() => () => {
     recordingRef.current = false;
     cameraStreamGenerationRef.current += 1;
@@ -500,9 +534,15 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     ? Math.max(0, (clock - segmentStartedAtClockRef.current) / 1000)
     : 0;
   const latestRemoteSegment = session?.segments.filter((segment) => segment.status === "READY").at(-1);
-  const remoteSegmentClock = latestRemoteSegment?.readyAt || session?.recordingStartedAt;
-  const remoteActiveSeconds = remoteLiveStream && remoteSegmentClock
-    ? Math.min(12, Math.max(0, (clock - Date.parse(remoteSegmentClock)) / 1000))
+  const remoteClockCandidates = [latestRemoteSegment?.readyAt, wirelessCamera?.broadcastStartedAt, session?.recordingStartedAt]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+  const remoteSegmentClock = remoteClockCandidates.length ? Math.max(...remoteClockCandidates) : null;
+  const wirelessPartActive = Boolean(wirelessCamera?.broadcasting);
+  const wirelessStartPending = Boolean(wirelessCamera?.desiredBroadcasting && !wirelessCamera.broadcasting);
+  const remoteActiveSeconds = (remoteLiveStream || wirelessPartActive) && remoteSegmentClock
+    ? Math.min(12, Math.max(0, (clock - remoteSegmentClock) / 1000))
     : 0;
   const externalLinkMode = session?.provider === "external-link";
   const externalElapsedSeconds = externalLinkMode && session?.startedAt
@@ -512,8 +552,10 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const liveEdgeSeconds = Math.max(availableEdgeSeconds + remoteActiveSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds, externalTimelineSeconds);
   const currentTime = externalLinkMode
     ? (externalPlayerReady ? externalPlayerTime : externalElapsedSeconds)
-    : atLiveEdge && (cameraConnected || remoteLiveStream) ? liveEdgeSeconds : playheadSeconds;
+    : atLiveEdge && (cameraConnected || remoteLiveStream || wirelessPartActive) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
+  const wirelessMode = Boolean(wirelessCamera?.paired);
+  const partPaused = wirelessMode && activeLive ? !wirelessPartActive && !wirelessStartPending : paused;
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
   const currentExercise = training?.exercises.find((exercise) => exercise.endTimeSeconds === null) ?? null;
   const lastMoment = training?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
@@ -686,7 +728,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
   const togglePlayback = useCallback(() => {
     setPreviewEnd(null);
-    if (atLiveEdge && (cameraConnected || remoteLiveStream)) {
+    if (atLiveEdge && (cameraConnected || remoteLiveStream || wirelessPartActive)) {
       if (!cameraConnected && remoteLiveVideoRef.current?.paused) {
         void remoteLiveVideoRef.current.play().catch(() => setRemotePlaybackNeedsAction(true));
         return;
@@ -703,15 +745,15 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     }
     const latest = readySegments.at(-1);
     if (latest) openSegment(latest, 0, true, false);
-  }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, remoteLiveStream, seekVirtual]);
+  }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, remoteLiveStream, seekVirtual, wirelessPartActive]);
 
   const markMoment = useCallback(async (momentTypeId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
-    if (!recording && !remoteLiveStream && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
-    if (paused && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
+    if (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
+    if (partPaused && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
     const markedAtSeconds = externalLinkMode ? currentTime : atLiveEdge ? liveEdgeSeconds : playheadSeconds;
     const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
-    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? (externalLinkMode ? 0 : archivePartStartedAtRef.current);
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? (externalLinkMode ? 0 : wirelessPartActive ? wirelessPartStartedAtRef.current : archivePartStartedAtRef.current);
     setBusyMomentTypeId(momentTypeId);
     try {
       const saved = await apiFetch<MomentRecord>(`/api/trainings/${trainingId}/live/moments`, {
@@ -726,15 +768,15 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     } finally {
       setBusyMomentTypeId(null);
     }
-  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, trainingId, paused, playheadSeconds, recording, remoteLiveStream, session]);
+  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, trainingId, partPaused, playheadSeconds, recording, remoteLiveStream, session, wirelessPartActive]);
 
   const markPlayerAction = useCallback(async (playerId: string) => {
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a player action.");
-    if (!recording && !remoteLiveStream && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
-    if (paused && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
+    if (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
+    if (partPaused && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
     const markedAtSeconds = externalLinkMode ? currentTime : atLiveEdge ? liveEdgeSeconds : playheadSeconds;
     const recordedPart = localParts.find((part) => markedAtSeconds >= part.startTimeSeconds - 0.05 && markedAtSeconds <= part.startTimeSeconds + part.durationSeconds + 0.05);
-    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? (externalLinkMode ? 0 : archivePartStartedAtRef.current);
+    const partStartedAtSeconds = recordedPart?.startTimeSeconds ?? (externalLinkMode ? 0 : wirelessPartActive ? wirelessPartStartedAtRef.current : archivePartStartedAtRef.current);
     setBusyPlayerId(playerId);
     try {
       const saved = await apiFetch<PlayerActionRecord>(`/api/trainings/${trainingId}/live/player-actions`, {
@@ -748,7 +790,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     } finally {
       setBusyPlayerId(null);
     }
-  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, paused, playheadSeconds, recording, remoteLiveStream, session, trainingId]);
+  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, partPaused, playheadSeconds, recording, remoteLiveStream, session, trainingId, wirelessPartActive]);
 
   async function startExerciseAt(timeSeconds: number) {
     const exercise = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, { method: "POST", body: JSON.stringify({ action: "start", timeSeconds: roundTime(timeSeconds) }) });
@@ -1144,6 +1186,107 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
       return null;
     } catch (error) {
       return `${error instanceof Error ? error.message : "Realtime camera sharing could not start."} Local recording and cloud replay are still available.`;
+    }
+  }
+
+  async function waitForWirelessCamera(commandVersion: number, timeoutMs = 35_000) {
+    const deadline = Date.now() + timeoutMs;
+    let latest: WirelessCameraStatus | null = null;
+    while (Date.now() < deadline) {
+      latest = await apiFetch<WirelessCameraStatus>(`/api/trainings/${trainingId}/camera-control`);
+      setWirelessCamera(latest);
+      if (latest.acknowledgedVersion >= commandVersion && !latest.broadcasting) return latest;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+    throw new Error(latest?.online
+      ? "The phone is still finalizing the last replay clip. Keep both pages open and try again in a moment."
+      : "The phone camera is offline. Reopen the QR link on the phone before finishing this exercise.");
+  }
+
+  async function startWirelessExercise() {
+    if (pausing || stopping) return;
+    setPausing(true);
+    try {
+      const result = await apiFetch<WirelessCameraCommandResult>(`/api/trainings/${trainingId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "start" }),
+      });
+      setWirelessCamera(result);
+      if (result.session) applySession(result.session);
+      const edge = result.session ? getReplayEdge(result.session.segments.filter((segment) => segment.status === "READY")) : availableEdgeSeconds;
+      wirelessPartStartedAtRef.current = edge;
+      setPaused(false);
+      setAtLiveEdge(true);
+      setReplayTarget(null);
+      const exercise = currentExercise || await startExerciseAt(edge);
+      setNotice(`Exercise ${exercise.number} is starting from the training computer. Keep the phone camera page open.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The wireless camera could not be started.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function pauseWirelessExercise() {
+    if (pausing || stopping || !wirelessPartActive) return;
+    setPausing(true);
+    try {
+      const command = await apiFetch<WirelessCameraStatus>(`/api/trainings/${trainingId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "stop" }),
+      });
+      setWirelessCamera(command);
+      await waitForWirelessCamera(command.commandVersion);
+      const refreshed = await apiFetch<LiveSessionRecord | null>(`/api/trainings/${trainingId}/live`);
+      applySession(refreshed);
+      const edge = refreshed ? getReplayEdge(refreshed.segments.filter((segment) => segment.status === "READY")) : liveEdgeSeconds;
+      if (currentExercise) await endExerciseAt(edge);
+      setPaused(true);
+      setAtLiveEdge(false);
+      setNotice("The exercise was finalized on the phone. Start the next exercise from this computer when ready.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The phone could not finalize the exercise.");
+    } finally {
+      setPausing(false);
+    }
+  }
+
+  async function stopWirelessTraining() {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      const command = await apiFetch<WirelessCameraStatus>(`/api/trainings/${trainingId}/camera-control`, {
+        method: "PATCH",
+        body: JSON.stringify({ command: "end" }),
+      });
+      setWirelessCamera(command);
+      await waitForWirelessCamera(command.commandVersion);
+      const refreshed = await apiFetch<LiveSessionRecord | null>(`/api/trainings/${trainingId}/live`);
+      const edgeBeforeEnd = refreshed ? getReplayEdge(refreshed.segments.filter((segment) => segment.status === "READY")) : liveEdgeSeconds;
+      if (currentExercise) await endExerciseAt(edgeBeforeEnd);
+      const ended = await apiFetch<LiveSessionRecord>(`/api/trainings/${trainingId}/live`, { method: "PATCH" });
+      applySession(ended);
+      setPaused(false);
+      setAtLiveEdge(false);
+      const latest = ended.segments.filter((segment) => segment.status === "READY" && segment.playbackUrl).at(-1);
+      if (latest) openSegment(latest, 0, false, false);
+      setNotice("The training ended. The phone finalized its last replay clip before the session was closed.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The wireless training could not be stopped cleanly.");
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  async function disconnectWirelessCamera() {
+    if (wirelessPartActive || wirelessStartPending || pausing || stopping) return;
+    try {
+      await apiFetch(`/api/trainings/${trainingId}/camera-pairing`, { method: "DELETE" });
+      setWirelessCamera(null);
+      setPaused(false);
+      setNotice("The phone camera was disconnected. Press the camera button again to connect this computer's camera.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The phone camera could not be disconnected.");
     }
   }
 
@@ -1803,31 +1946,33 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
         <button type="button" title="Copy live training link" aria-label="Copy live training link" onClick={() => void copyLiveLink()} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Copy size={13} /></button>
       </div>
       <div className="order-3 grid w-full min-w-0 grid-cols-2 gap-1.5 px-2 py-1.5 sm:grid-cols-3 lg:grid-cols-6 xl:order-none xl:flex xl:w-auto xl:items-center" aria-label="Tag the previous 20 seconds">
-        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || (paused && !externalLinkMode) || (!recording && !remoteLiveStream && !externalLinkMode); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0 max-xl:flex-1">
-        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
-        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-24 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={recording || pausing || stopping}>
+        <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={wirelessMode || recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
+        <Select aria-label="Capture mode" title="Capture mode" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-24 sm:flex-none" value={captureMode} onChange={(event) => changeCaptureMode(event.target.value as CaptureMode)} disabled={wirelessMode || recording || pausing || stopping}>
           <option value="standard">Standard</option>
           <option value="compatibility">Compatibility 720p</option>
         </Select>
-        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
+        <Button size="sm" className="h-8 shrink-0 px-2 text-[10px]" title={`Rotate camera 90° clockwise · current rotation ${cameraRotation}°`} aria-label={`Rotate camera 90 degrees clockwise; current rotation ${cameraRotation} degrees`} onClick={() => void rotateCamera()} disabled={wirelessMode || recording || pausing || stopping}><RotateCw size={12} />{cameraRotation}°</Button>
         {cameraConnected || captureDiagnostics.reconnections > 0 ? <Badge className="hidden max-w-40 truncate border-cyan-300/20 bg-cyan-300/[.07] text-[9px] text-cyan-100 2xl:inline-flex" title={captureDiagnosticSummary}><Activity size={11} />{captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : captureProfiles[captureMode].label} · {captureDiagnostics.reconnections}R</Badge> : null}
-        {(recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} exercise{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
+        {wirelessMode ? <Badge className="hidden max-w-32 truncate border-cyan-300/25 bg-cyan-300/10 text-[9px] text-cyan-100 2xl:inline-flex"><Smartphone size={11} />{wirelessCamera?.broadcasting ? "Phone live" : wirelessCamera?.ready ? "Phone ready" : wirelessCamera?.online ? "Allow camera" : "Phone offline"}</Badge> : (recording || stopping) && localArchiveName ? <Badge className="hidden max-w-28 truncate border-emerald-300/25 bg-emerald-300/10 text-[9px] text-emerald-100 2xl:inline-flex" title={`${stopping ? "Finalizing" : "Saving"} locally: ${localArchiveName}`}>{stopping ? "Finalizing file" : "Local copy"}</Badge> : paused && localParts.length ? <Badge className="hidden border-amber-300/25 bg-amber-300/10 text-[9px] text-amber-100 2xl:inline-flex">{localParts.length} exercise{localParts.length === 1 ? "" : "s"} saved</Badge> : null}
         <Button
           size="icon"
           className="h-8 w-8"
-          title={recording ? "Preserve this exercise before reconnecting the camera" : paused ? "Reconnect the camera and continue recording" : cameraConnected ? "Reconnect camera" : "Connect camera"}
-          onClick={() => recording
+          title={wirelessMode ? "Disconnect the phone and use this computer's camera" : recording ? "Preserve this exercise before reconnecting the camera" : paused ? "Reconnect the camera and continue recording" : cameraConnected ? "Reconnect camera" : "Connect camera"}
+          onClick={() => wirelessMode
+            ? void disconnectWirelessCamera()
+            : recording
             ? void handleCameraLoss("Camera reconnection requested.")
             : paused && activeLive
               ? void resumeRecording()
               : void connectCamera()}
-          disabled={pausing || stopping}
+          disabled={wirelessPartActive || wirelessStartPending || pausing || stopping}
         ><Camera size={13} /></Button>
-        <Button size="icon" className="h-8 w-8" title="Use a YouTube video or live-stream link" aria-label="Use a YouTube link" onClick={() => { setExternalLinkInput(session?.provider === "external-link" ? session.playbackUrl || "" : ""); setShowExternalLink((value) => !value); }} disabled={recording || stopping}><Link2 size={13} /></Button>
-        <Button size="icon" className="h-8 w-8" title="Connect a wireless phone camera" aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={recording || stopping}><Smartphone size={13} /></Button>
-        {externalLinkMode && activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopExternalLink()} disabled={stopping}><CircleStop size={12} />{stopping ? "Ending…" : "End link"}</Button> : !activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />Start exercise</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start exercise</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End training</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving exercise…" : "Start exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End training</Button></>}
+        <Button size="icon" className="h-8 w-8" title="Use a YouTube video or live-stream link" aria-label="Use a YouTube link" onClick={() => { setExternalLinkInput(session?.provider === "external-link" ? session.playbackUrl || "" : ""); setShowExternalLink((value) => !value); }} disabled={recording || wirelessPartActive || wirelessStartPending || stopping}><Link2 size={13} /></Button>
+        <Button size="icon" className="h-8 w-8" title={wirelessMode ? "Wireless phone camera already paired" : "Connect a wireless phone camera"} aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={wirelessMode || recording || wirelessPartActive || wirelessStartPending || stopping}><Smartphone size={13} /></Button>
+        {externalLinkMode && activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopExternalLink()} disabled={stopping}><CircleStop size={12} />{stopping ? "Ending…" : "End link"}</Button> : wirelessMode ? (!activeLive || partPaused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startWirelessExercise()} disabled={!wirelessCamera?.ready || wirelessStartPending || pausing || stopping}>{wirelessStartPending || pausing ? <Loader2 size={12} className="animate-spin" /> : <Radio size={12} />}{wirelessStartPending ? "Starting…" : activeLive ? "Start next exercise" : wirelessCamera?.ready ? "Start exercise" : "Waiting for phone"}</Button>{activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button> : null}</> : <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseWirelessExercise()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></>) : !activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />Start exercise</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start exercise</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End training</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving exercise…" : "Start exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End training</Button></>}
       </div>
     </Panel>
 
@@ -1850,9 +1995,9 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[16rem_minmax(0,1fr)_16rem]">
       <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {externalLinkMode && session?.playbackUrl ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} /> : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{paused ? "Exercise recording saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : "Connect the training camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{paused ? "Select a tagged moment to review it, or start the next exercise." : "Recording continues while you independently control replay."}</p></div>}
+          {externalLinkMode && session?.playbackUrl ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} /> : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? wirelessMode ? "Phone camera ready" : "Exercise recording saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the training camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next exercise from this computer." : "Recording continues while you independently control replay."}</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
-          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${paused ? "bg-amber-600" : "bg-red-600"}`}>{paused ? "BETWEEN EXERCISES" : `● EXERCISE ${currentExercise?.number ?? ""}`}</span> : null}
+          {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${partPaused ? "bg-amber-600" : "bg-red-600"}`}>{partPaused ? "BETWEEN EXERCISES" : `● EXERCISE ${currentExercise?.number ?? ""}`}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
           {atLiveEdge && cameraConnected ? <span className="absolute bottom-3 left-3 max-w-[calc(100%-1.5rem)] truncate rounded-md border border-white/10 bg-slate-950/75 px-2 py-1 font-mono text-[9px] text-slate-300 backdrop-blur-sm" title={captureDiagnosticSummary}><Activity size={10} className="mr-1 inline text-cyan-300" />{captureProfiles[captureMode].label} · {captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "detecting"} · {captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)}fps` : "fps—"} · {captureDiagnostics.reconnections}R</span> : null}
         </div>
@@ -1883,7 +2028,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
       <Panel className="order-3 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Players</p><p className="mt-1 text-xs text-slate-400">Click a name to save the previous 15 seconds</p></div><Badge><UserRound size={11} className="mr-1" />{training.participants.length}</Badge></div></div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">{training.participants.length === 0 ? <p className="p-3 text-xs text-slate-500">No players were selected for this training.</p> : training.participants.map(({ player }) => { const busy = busyPlayerId === player.id; const count = training.playerActions.filter((action) => action.playerId === player.id).length; const unavailable = !activeLive || (paused && !externalLinkMode) || (!recording && !remoteLiveStream && !externalLinkMode); return <button key={player.id} type="button" disabled={unavailable || busyPlayerId !== null} onClick={() => void markPlayerAction(player.id)} title={`${player.name}: save the previous 15 seconds`} className="mb-1 flex h-9 w-full items-center gap-2 rounded-md border border-white/10 bg-white/[.035] px-2 text-left transition hover:border-cyan-300/30 hover:bg-cyan-300/10 disabled:opacity-40"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-black/25 font-mono text-[9px] text-cyan-100">{player.shirtNumber ?? "—"}</span><span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">{player.name}</span><span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-white/[.07] px-1 text-[9px] text-slate-400">{busy ? "…" : count}</span></button>; })}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">{training.participants.length === 0 ? <p className="p-3 text-xs text-slate-500">No players were selected for this training.</p> : training.participants.map(({ player }) => { const busy = busyPlayerId === player.id; const count = training.playerActions.filter((action) => action.playerId === player.id).length; const unavailable = !activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode); return <button key={player.id} type="button" disabled={unavailable || busyPlayerId !== null} onClick={() => void markPlayerAction(player.id)} title={`${player.name}: save the previous 15 seconds`} className="mb-1 flex h-9 w-full items-center gap-2 rounded-md border border-white/10 bg-white/[.035] px-2 text-left transition hover:border-cyan-300/30 hover:bg-cyan-300/10 disabled:opacity-40"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-black/25 font-mono text-[9px] text-cyan-100">{player.shirtNumber ?? "—"}</span><span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">{player.name}</span><span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-white/[.07] px-1 text-[9px] text-slate-400">{busy ? "…" : count}</span></button>; })}</div>
         <div className="shrink-0 border-t border-white/10 px-3 py-2 text-[9px] text-slate-500">{training.playerActionCount} individual actions saved</div>
       </Panel>
     </div>
