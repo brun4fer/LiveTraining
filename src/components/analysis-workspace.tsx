@@ -62,6 +62,7 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
   const [loadingCloudLibrary, setLoadingCloudLibrary] = useState(false);
   const [cloudLibraryError, setCloudLibraryError] = useState<string | null>(null);
   const [attachingAssetId, setAttachingAssetId] = useState<string | null>(null);
+  const [selectedPlannedExerciseId, setSelectedPlannedExerciseId] = useState("");
   const { soundEnabled, setSoundEnabled } = useSoundPreference();
 
   useEffect(() => {
@@ -74,6 +75,8 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
       .then(async ([trainingData, settingsData, account]) => {
         if (!active) return;
         setTraining(trainingData);
+        const firstAvailable = trainingData.plannedExercises.find((plan) => !trainingData.exercises.some((exercise) => exercise.plannedExerciseId === plan.id || (!exercise.plannedExerciseId && exercise.number === plan.number)));
+        setSelectedPlannedExerciseId(firstAvailable?.id || "");
         setSettings(settingsData);
         setTeamName(account?.teamName || "Team");
         setSelectedMomentId(trainingData.moments[0]?.id || null);
@@ -236,8 +239,13 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
     if (!training || !sourceUrl) return;
     const active = training.exercises.find((exercise) => exercise.endTimeSeconds === null);
     try {
-      const saved = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${training.id}/exercises`, { method: "POST", body: JSON.stringify({ action: active ? "end" : "start", timeSeconds: roundTime(currentTime) }) });
+      if (!active && training.plannedExercises.length && !selectedPlannedExerciseId) return setNotice("Select the exercise represented by this part of the video.");
+      const saved = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${training.id}/exercises`, { method: "POST", body: JSON.stringify({ action: active ? "end" : "start", timeSeconds: roundTime(currentTime), plannedExerciseId: active ? undefined : selectedPlannedExerciseId || null }) });
       setTraining((current) => current ? { ...current, exercises: active ? current.exercises.map((item) => item.id === saved.id ? saved : item) : [...current.exercises, saved], exerciseCount: active ? current.exerciseCount : current.exerciseCount + 1 } : current);
+      if (!active) {
+        const next = training.plannedExercises.find((plan) => plan.id !== selectedPlannedExerciseId && !training.exercises.some((exercise) => exercise.plannedExerciseId === plan.id || (!exercise.plannedExerciseId && exercise.number === plan.number)));
+        setSelectedPlannedExerciseId(next?.id || "");
+      }
       setNotice(`Exercise ${saved.number} ${active ? "ended" : "started"} at ${formatTime(currentTime)}.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Could not update the exercise."); }
   }
@@ -550,7 +558,8 @@ export function AnalysisWorkspace({ trainingId }: { trainingId: string }) {
               <Button size="icon" className="h-8 w-8" variant="secondary" disabled={!sourceUrl} title="Forward 15 seconds" onClick={() => seekBy(15)}><ChevronsRight size={15} className="scale-125" /></Button>
               <div className="flex overflow-hidden rounded-md border border-white/10">{[1, 2, 4].map((rate) => <button key={rate} type="button" onClick={() => setRate(rate)} className={`h-8 px-2 text-[10px] font-semibold transition ${playbackRate === rate ? "bg-cyan-300 text-slate-950" : "bg-white/[.04] text-slate-300 hover:bg-white/[.1]"}`}>{rate}×</button>)}</div>
               <Button size="icon" variant="danger" className="h-8 w-8" disabled={!lastMoment} title={lastMoment ? `Delete last recorded moment: ${lastMoment.momentType.name} at ${formatTime(lastMoment.startTimeSeconds)}` : "No recorded moment to delete"} aria-label="Delete last recorded moment" onClick={() => void removeLastMoment(lastMoment)}><Trash2 size={14} /></Button>
-              <Button size="sm" variant={activeExercise ? "danger" : "primary"} className="ml-1 h-8 border-l px-2 text-[10px]" disabled={!sourceUrl} onClick={() => void toggleExercise()}><Dumbbell size={12} />{activeExercise ? `End exercise ${activeExercise.number}` : "Start exercise"}</Button>
+              {!activeExercise && training.plannedExercises.length ? <Select aria-label="Exercise interval" className="ml-1 h-8 w-40 py-0 text-[10px]" value={selectedPlannedExerciseId} onChange={(event) => setSelectedPlannedExerciseId(event.target.value)}><option value="">Select exercise…</option>{training.plannedExercises.filter((plan) => !training.exercises.some((exercise) => exercise.plannedExerciseId === plan.id || (!exercise.plannedExerciseId && exercise.number === plan.number))).map((plan) => <option key={plan.id} value={plan.id}>Ex. {plan.number} · {plan.name}</option>)}</Select> : null}
+              <Button size="sm" variant={activeExercise ? "danger" : "primary"} className="ml-1 h-8 border-l px-2 text-[10px]" disabled={!sourceUrl || (!activeExercise && training.plannedExercises.length > 0 && !selectedPlannedExerciseId)} onClick={() => void toggleExercise()}><Dumbbell size={12} />{activeExercise ? `End exercise ${activeExercise.number}` : "Start selected exercise"}</Button>
               <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={duration || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!sourceUrl} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" variant="secondary" disabled={!sourceUrl || seekTime === ""}>Go</Button></form>
             </div></div>
             <div className="flex shrink-0 items-center gap-1"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(duration)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} /><VideoFullscreenButton targetRef={workspaceRef} /><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => fileInputRef.current?.click()} disabled={uploading}><Upload size={12} />Upload video</Button><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void downloadFullVideo()} disabled={!training.video || downloadingVideo}>{downloadingVideo ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}Download full video</Button></div>

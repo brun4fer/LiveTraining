@@ -158,6 +158,14 @@ export function createMediaPlaybackUrl(key: string) {
   return { url: presignedUrl("GET", key, [], lifetime), expiresAt: new Date(Date.now() + lifetime * 1000).toISOString() };
 }
 
+export function createMediaObjectUploadUrl(key: string) {
+  return presignedUrl("PUT", key, [], 5 * 60);
+}
+
+export async function deleteMediaObject(key: string) {
+  await signedRequest("DELETE", key);
+}
+
 export async function headMediaObject(key: string) {
   const response = await signedRequest("HEAD", key);
   return {

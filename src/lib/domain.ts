@@ -11,9 +11,33 @@ export type MomentTypeRecord = {
 export type ExerciseRecord = {
   id: string;
   trainingId: string;
+  plannedExerciseId: string | null;
   number: number;
   startTimeSeconds: number;
   endTimeSeconds: number | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PlannedExerciseRecord = {
+  id: string;
+  trainingId: string;
+  number: number;
+  name: string;
+  description: string | null;
+  durationMinutes: number | null;
+  imageFileName: string | null;
+  imageMimeType: string | null;
+  imageFileSize: number | null;
+  imageUrl: string | null;
+  video: {
+    fileName: string;
+    fileSize: number;
+    durationSeconds: number;
+    mimeType: string;
+    storageStatus: "LOCAL" | "UPLOADING" | "READY" | "FAILED";
+    uploadedAt: string | null;
+  } | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -142,6 +166,7 @@ export type TrainingSummary = {
   momentCount: number;
   playerActionCount: number;
   exerciseCount: number;
+  plannedExerciseCount: number;
   participantCount: number;
   liveStatus?: "PREPARING" | "LIVE" | "ENDED" | "FAILED" | null;
 };
@@ -152,6 +177,7 @@ export type TrainingDetail = TrainingSummary & {
   moments: MomentRecord[];
   playerActions: PlayerActionRecord[];
   exercises: ExerciseRecord[];
+  plannedExercises: PlannedExerciseRecord[];
   participants: Array<{ playerId: string; sortOrder: number; player: PlayerRecord }>;
 };
 

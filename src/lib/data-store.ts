@@ -4,8 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { requireManagementWorkspace, requireWorkspace } from "@/lib/auth";
 import { removeMediaReference } from "@/lib/media-library";
 import { mediaPrisma } from "@/lib/media-prisma";
-import { abortMediaMultipartUpload } from "@/lib/media-r2";
+import { abortMediaMultipartUpload, createMediaPlaybackUrl, deleteMediaObject } from "@/lib/media-r2";
 import { ensureMediaWorkspace } from "@/lib/media-workspace";
+import { plannedExerciseVideoReferenceId } from "@/lib/planned-exercise-video";
 import { abortMultipartUpload, deleteR2Object } from "@/lib/r2";
 import { serializeVideo } from "@/lib/video";
 
@@ -28,6 +29,7 @@ export const trainingInclude = {
     orderBy: { startTimeSeconds: "asc" as const },
   },
   exercises: { orderBy: { number: "asc" as const } },
+  plannedExercises: { orderBy: { number: "asc" as const } },
   participants: {
     include: { player: true },
     orderBy: [{ sortOrder: "asc" as const }, { player: { name: "asc" as const } }],
@@ -39,15 +41,18 @@ function serializeTraining(training: Record<string, unknown>) {
   const moments = (training.moments as unknown[] | undefined) ?? [];
   const playerActions = (training.playerActions as unknown[] | undefined) ?? [];
   const exercises = (training.exercises as unknown[] | undefined) ?? [];
+  const plannedExercises = (training.plannedExercises as Array<Record<string, unknown>> | undefined) ?? [];
   const participants = (training.participants as unknown[] | undefined) ?? [];
   const trainingDate = training.trainingDate;
   return {
     ...training,
     trainingDate: trainingDate instanceof Date ? trainingDate.toISOString() : trainingDate,
     video: video ? serializeVideo(video) : null,
+    plannedExercises: plannedExercises.map(serializePlannedExercise),
     momentCount: moments.length,
     playerActionCount: playerActions.length,
     exerciseCount: exercises.length,
+    plannedExerciseCount: plannedExercises.length,
     participantCount: participants.length,
   };
 }
@@ -59,7 +64,7 @@ export async function listTrainings() {
     include: {
       video: true,
       liveSessions: { select: { status: true }, orderBy: { createdAt: "desc" }, take: 1 },
-      _count: { select: { moments: true, playerActions: true, exercises: true, participants: true } },
+      _count: { select: { moments: true, playerActions: true, exercises: true, plannedExercises: true, participants: true } },
     },
     orderBy: [{ trainingDate: "desc" }, { createdAt: "desc" }],
   });
@@ -75,6 +80,7 @@ export async function listTrainings() {
     momentCount: training._count.moments,
     playerActionCount: training._count.playerActions,
     exerciseCount: training._count.exercises,
+    plannedExerciseCount: training._count.plannedExercises,
     participantCount: training._count.participants,
     liveStatus: training.liveSessions[0]?.status ?? null,
   }));
@@ -96,6 +102,7 @@ export async function createTraining(input: Record<string, unknown>) {
   const trainingUnitNumber = positiveInteger(input.trainingUnitNumber, "Training unit");
   const trainingDate = validDate(input.trainingDate);
   const participantIds = stringArray(input.participantIds);
+  const plannedExercises = plannedExerciseInputs(input.plannedExercises);
   if (!seasonId) throw new Error("Season is required.");
   if (participantIds.length === 0) throw new Error("Select at least one player for this training.");
 
@@ -118,6 +125,9 @@ export async function createTraining(input: Record<string, unknown>) {
       notes: optionalString(input.notes),
       participants: {
         create: participantIds.map((playerId, sortOrder) => ({ playerId, sortOrder })),
+      },
+      plannedExercises: {
+        create: plannedExercises.map((exercise, index) => ({ ...exercise, number: index + 1 })),
       },
     },
     include: trainingInclude,
@@ -164,7 +174,7 @@ export async function updateTraining(trainingId: string, input: Record<string, u
 export async function deleteTraining(trainingId: string) {
   const account = await requireManagementWorkspace();
   const { workspace } = account;
-  const training = await prisma.training.findFirstOrThrow({ where: { id: trainingId, workspaceId: workspace.id }, include: { video: true } });
+  const training = await prisma.training.findFirstOrThrow({ where: { id: trainingId, workspaceId: workspace.id }, include: { video: true, plannedExercises: { select: { id: true, imageStorageKey: true, videoMediaAssetId: true } } } });
   if (training.video?.mediaAssetId) {
     const { appId, mediaWorkspace } = await ensureMediaWorkspace(account);
     const asset = await mediaPrisma.mediaAsset.findFirst({ where: { id: training.video.mediaAssetId, mediaWorkspaceId: mediaWorkspace.id } });
@@ -177,7 +187,104 @@ export async function deleteTraining(trainingId: string) {
     if (training.video?.storageKey && training.video.uploadId) await abortMultipartUpload(training.video.storageKey, training.video.uploadId).catch(() => undefined);
     if (training.video?.storageKey) await deleteR2Object(training.video.storageKey);
   }
+  if (training.plannedExercises.some((exercise) => exercise.videoMediaAssetId)) {
+    const { appId, mediaWorkspace } = await ensureMediaWorkspace(account);
+    for (const exercise of training.plannedExercises) {
+      if (!exercise.videoMediaAssetId) continue;
+      const pending = await mediaPrisma.mediaAsset.findFirst({ where: { id: exercise.videoMediaAssetId, mediaWorkspaceId: mediaWorkspace.id, storageStatus: "UPLOADING" } });
+      if (pending?.uploadId) {
+        await abortMediaMultipartUpload(pending.storageKey, pending.uploadId).catch(() => undefined);
+        await mediaPrisma.mediaAsset.update({ where: { id: pending.id }, data: { storageStatus: "FAILED", uploadId: null } }).catch(() => undefined);
+      }
+      await removeMediaReference(appId, plannedExerciseVideoReferenceId(exercise.id)).catch(() => undefined);
+    }
+  }
+  await Promise.all(training.plannedExercises.flatMap((exercise) => exercise.imageStorageKey ? [deleteMediaObject(exercise.imageStorageKey).catch(() => undefined)] : []));
   await prisma.training.delete({ where: { id: trainingId } });
+}
+
+export function serializePlannedExercise(exercise: Record<string, unknown>) {
+  const imageStorageKey = typeof exercise.imageStorageKey === "string" ? exercise.imageStorageKey : null;
+  const videoFileName = typeof exercise.videoFileName === "string" ? exercise.videoFileName : null;
+  const videoFileSize = typeof exercise.videoFileSize === "bigint" ? Number(exercise.videoFileSize) : Number(exercise.videoFileSize || 0);
+  const videoDurationSeconds = Number(exercise.videoDurationSeconds || 0);
+  const videoMimeType = typeof exercise.videoMimeType === "string" ? exercise.videoMimeType : null;
+  const videoStorageStatus = typeof exercise.videoStorageStatus === "string" ? exercise.videoStorageStatus : null;
+  const videoUploadedAt = exercise.videoUploadedAt instanceof Date ? exercise.videoUploadedAt.toISOString() : exercise.videoUploadedAt ?? null;
+  return {
+    ...exercise,
+    imageStorageKey: undefined,
+    imageUrl: imageStorageKey ? createMediaPlaybackUrl(imageStorageKey).url : null,
+    videoFileName: undefined,
+    videoFileSize: undefined,
+    videoDurationSeconds: undefined,
+    videoMimeType: undefined,
+    videoLastModified: undefined,
+    videoStorageStatus: undefined,
+    videoMediaAssetId: undefined,
+    videoEtag: undefined,
+    videoUploadedAt: undefined,
+    video: videoFileName && videoFileSize > 0 && videoDurationSeconds > 0 && videoMimeType && videoStorageStatus ? {
+      fileName: videoFileName,
+      fileSize: videoFileSize,
+      durationSeconds: videoDurationSeconds,
+      mimeType: videoMimeType,
+      storageStatus: videoStorageStatus,
+      uploadedAt: videoUploadedAt,
+    } : null,
+  };
+}
+
+export async function createPlannedExercise(trainingId: string, input: Record<string, unknown>) {
+  const { workspace } = await requireManagementWorkspace();
+  await prisma.training.findFirstOrThrow({ where: { id: trainingId, workspaceId: workspace.id }, select: { id: true } });
+  const latest = await prisma.plannedExercise.findFirst({ where: { trainingId }, orderBy: { number: "desc" }, select: { number: true } });
+  const [exercise] = plannedExerciseInputs([input]);
+  const saved = await prisma.plannedExercise.create({ data: { trainingId, number: (latest?.number ?? 0) + 1, ...exercise } });
+  return serializePlannedExercise(saved as unknown as Record<string, unknown>);
+}
+
+export async function updatePlannedExercise(trainingId: string, plannedExerciseId: string, input: Record<string, unknown>) {
+  const { workspace } = await requireManagementWorkspace();
+  const current = await prisma.plannedExercise.findFirstOrThrow({ where: { id: plannedExerciseId, trainingId, training: { workspaceId: workspace.id } } });
+  const name = input.name === undefined ? current.name : requiredShortText(input.name, "Exercise name", 120);
+  const description = input.description === undefined ? current.description : optionalLimitedString(input.description, 4_000);
+  const durationMinutes = input.durationMinutes === undefined ? current.durationMinutes : optionalPositiveInteger(input.durationMinutes, "Duration");
+  const saved = await prisma.plannedExercise.update({ where: { id: current.id }, data: { name, description, durationMinutes } });
+  return serializePlannedExercise(saved as unknown as Record<string, unknown>);
+}
+
+export async function deletePlannedExercise(trainingId: string, plannedExerciseId: string) {
+  const account = await requireManagementWorkspace();
+  const { workspace } = account;
+  const exercise = await prisma.plannedExercise.findFirstOrThrow({ where: { id: plannedExerciseId, trainingId, training: { workspaceId: workspace.id } } });
+  if (await prisma.exercise.count({ where: { plannedExerciseId: exercise.id } })) throw new Error("This exercise already has a recorded interval and can no longer be deleted.");
+  const laterExercises = await prisma.plannedExercise.findMany({
+    where: { trainingId, number: { gt: exercise.number } },
+    select: { id: true },
+  });
+  if (laterExercises.length && await prisma.exercise.count({ where: { plannedExerciseId: { in: laterExercises.map((item) => item.id) } } })) {
+    throw new Error("This exercise cannot be deleted because a later planned exercise has already been recorded.");
+  }
+  const imageStorageKey = exercise.imageStorageKey;
+  await prisma.$transaction(async (tx) => {
+    await tx.plannedExercise.delete({ where: { id: exercise.id } });
+    const remaining = await tx.plannedExercise.findMany({ where: { trainingId }, orderBy: { number: "asc" }, select: { id: true } });
+    for (let index = 0; index < remaining.length; index += 1) await tx.plannedExercise.update({ where: { id: remaining[index].id }, data: { number: -(index + 1) } });
+    for (let index = 0; index < remaining.length; index += 1) {
+      await tx.plannedExercise.update({ where: { id: remaining[index].id }, data: { number: index + 1 } });
+    }
+  });
+  if (imageStorageKey) await deleteMediaObject(imageStorageKey).catch(() => undefined);
+  if (exercise.videoMediaAssetId) {
+    const { appId, mediaWorkspace } = await ensureMediaWorkspace(account);
+    const pending = await mediaPrisma.mediaAsset.findFirst({ where: { id: exercise.videoMediaAssetId, mediaWorkspaceId: mediaWorkspace.id, storageStatus: "UPLOADING" } });
+    if (pending?.uploadId) {
+      await abortMediaMultipartUpload(pending.storageKey, pending.uploadId).catch(() => undefined);
+      await mediaPrisma.mediaAsset.update({ where: { id: pending.id }, data: { storageStatus: "FAILED", uploadId: null } }).catch(() => undefined);
+    }
+    await removeMediaReference(appId, plannedExerciseVideoReferenceId(exercise.id)).catch(() => undefined);
+  }
 }
 
 export async function saveVideo(trainingId: string, input: Record<string, unknown>) {
@@ -286,8 +393,13 @@ export async function startExercise(trainingId: string, input: Record<string, un
   await prisma.training.findFirstOrThrow({ where: { id: trainingId, workspaceId: workspace.id } });
   const open = await prisma.exercise.findFirst({ where: { trainingId, endTimeSeconds: null } });
   if (open) throw new Error(`Exercise ${open.number} is already running.`);
+  const requestedPlanId = optionalString(input.plannedExerciseId);
+  const planned = requestedPlanId
+    ? await prisma.plannedExercise.findFirstOrThrow({ where: { id: requestedPlanId, trainingId }, select: { id: true, number: true } })
+    : null;
+  if (planned && await prisma.exercise.findFirst({ where: { trainingId, plannedExerciseId: planned.id } })) throw new Error(`Exercise ${planned.number} already has a recorded interval.`);
   const latest = await prisma.exercise.findFirst({ where: { trainingId }, orderBy: { number: "desc" } });
-  return prisma.exercise.create({ data: { trainingId, number: (latest?.number ?? 0) + 1, startTimeSeconds: at } });
+  return prisma.exercise.create({ data: { trainingId, plannedExerciseId: planned?.id ?? null, number: planned?.number ?? (latest?.number ?? 0) + 1, startTimeSeconds: at } });
 }
 
 export async function endExercise(trainingId: string, input: Record<string, unknown>) {
@@ -341,6 +453,39 @@ async function exerciseIdAtTime(trainingId: string, timeSeconds: number, request
 function optionalString(value: unknown) {
   const text = String(value ?? "").trim();
   return text || null;
+}
+
+function plannedExerciseInputs(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  if (value.length > 40) throw new Error("A training cannot contain more than 40 planned exercises.");
+  return value.map((item, index) => {
+    const input = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    return {
+      name: requiredShortText(input.name || `Exercise ${index + 1}`, "Exercise name", 120),
+      description: optionalLimitedString(input.description, 4_000),
+      durationMinutes: optionalPositiveInteger(input.durationMinutes, "Duration"),
+    };
+  });
+}
+
+function requiredShortText(value: unknown, label: string, maxLength: number) {
+  const text = String(value ?? "").trim();
+  if (!text) throw new Error(`${label} is required.`);
+  if (text.length > maxLength) throw new Error(`${label} is too long.`);
+  return text;
+}
+
+function optionalLimitedString(value: unknown, maxLength: number) {
+  const text = String(value ?? "").trim();
+  if (text.length > maxLength) throw new Error("The exercise description is too long.");
+  return text || null;
+}
+
+function optionalPositiveInteger(value: unknown, label: string) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > 1_440) throw new Error(`${label} must be a positive whole number.`);
+  return number;
 }
 
 function validDate(value: unknown) {

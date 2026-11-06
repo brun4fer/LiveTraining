@@ -163,6 +163,7 @@ model Training {
   moments            Moment[]
   playerActions      PlayerAction[]
   exercises          Exercise[]
+  plannedExercises   PlannedExercise[]
   participants       TrainingPlayer[]
   liveSessions       LiveSession[]
   seasonRecord       Season           @relation(fields: [seasonId], references: [id], onDelete: Restrict)
@@ -189,17 +190,50 @@ model TrainingPlayer {
 model Exercise {
   id               String         @id @default(cuid())
   trainingId       String
+  plannedExerciseId String?
   number           Int
   startTimeSeconds Float
   endTimeSeconds   Float?
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
   training         Training       @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  plannedExercise  PlannedExercise? @relation(fields: [plannedExerciseId], references: [id], onDelete: SetNull)
   moments          Moment[]
   playerActions    PlayerAction[]
 
   @@unique([trainingId, number])
+  @@unique([trainingId, plannedExerciseId])
   @@index([trainingId, startTimeSeconds])
+  @@index([plannedExerciseId])
+}
+
+model PlannedExercise {
+  id                   String              @id @default(cuid())
+  trainingId           String
+  number               Int
+  name                 String
+  description          String?
+  durationMinutes      Int?
+  imageStorageKey      String?             @unique
+  imageFileName        String?
+  imageMimeType        String?
+  imageFileSize        Int?
+  videoFileName        String?
+  videoFileSize        BigInt?
+  videoDurationSeconds Float?
+  videoMimeType        String?
+  videoLastModified    DateTime?
+  videoStorageStatus   VideoStorageStatus?
+  videoMediaAssetId    String?
+  videoEtag            String?
+  videoUploadedAt      DateTime?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  training             Training            @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  recordings           Exercise[]
+
+  @@unique([trainingId, number])
+  @@index([trainingId, number])
 }
 
 model LiveSession {

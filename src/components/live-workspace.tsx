@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, ArrowLeft, Camera, ChevronsLeft, ChevronsRight, CircleStop, Clock3, Copy, Download, Dumbbell, Link2, Loader2, Pause, Pencil, Play, Radio, RotateCcw, RotateCw, Settings2, Smartphone, Trash2, UserRound, Users, Video, X } from "lucide-react";
@@ -19,6 +20,7 @@ import { closeWebRtcSession, publishCameraStream, receiveCameraStream, type Brow
 import { getRememberedTrainingVideoParts, rememberTrainingVideoPart, type LocalTrainingVideoPart, type LocalVideoFileHandle } from "@/lib/local-video-store";
 import { getReplayEdge, locateReplayPosition } from "@/lib/live-replay";
 import { shouldUploadReplayFromOrigin } from "@/lib/replay-upload-origin";
+import { getPlannedExerciseVideoUrl } from "@/lib/remote-video-store";
 import { SmartVideoExportSession } from "@/lib/smart-video-export";
 import { formatTime, roundTime } from "@/lib/time";
 import { downloadBlob, exportSegmentedMomentClip, planSegmentedMomentExport, type TimedVideoSource } from "@/lib/video-export";
@@ -342,16 +344,21 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const [externalPlayerEdge, setExternalPlayerEdge] = useState(0);
   const [externalPlayerReady, setExternalPlayerReady] = useState(false);
   const [wirelessCamera, setWirelessCamera] = useState<WirelessCameraStatus | null>(null);
+  const [selectedPlannedExerciseId, setSelectedPlannedExerciseId] = useState("");
+  const [plannedVideoUrl, setPlannedVideoUrl] = useState<string | null>(null);
+  const [plannedVideoDuration, setPlannedVideoDuration] = useState(0);
+  const [plannedVideoLoading, setPlannedVideoLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [liveViewers, setLiveViewers] = useState<LiveViewer[]>([]);
   const [clock, setClock] = useState(() => Date.now());
+  const plannedVideoExercisePromiseRef = useRef<Promise<string> | null>(null);
   const { soundEnabled, setSoundEnabled } = useSoundPreference();
 
   useEffect(() => {
     if (remoteLiveVideoRef.current) remoteLiveVideoRef.current.muted = !soundEnabled;
     if (replayVideoRef.current) replayVideoRef.current.muted = !soundEnabled;
-  }, [soundEnabled, remoteLiveStream, replayTarget]);
+  }, [plannedVideoUrl, soundEnabled, remoteLiveStream, replayTarget]);
 
   function disposeRotatedCameraOutput() {
     const resources = rotatedCameraResourcesRef.current;
@@ -550,7 +557,9 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     : 0;
   const externalTimelineSeconds = externalPlayerReady ? externalPlayerEdge : externalElapsedSeconds;
   const liveEdgeSeconds = Math.max(availableEdgeSeconds + remoteActiveSeconds, segmentTimelineCursorRef.current + activeSegmentSeconds, externalTimelineSeconds);
-  const currentTime = externalLinkMode
+  const currentTime = plannedVideoUrl
+    ? playheadSeconds
+    : externalLinkMode
     ? (externalPlayerReady ? externalPlayerTime : externalElapsedSeconds)
     : atLiveEdge && (cameraConnected || remoteLiveStream || wirelessPartActive) ? liveEdgeSeconds : playheadSeconds;
   const activeLive = session?.status === "LIVE";
@@ -558,7 +567,46 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   const partPaused = wirelessMode && activeLive ? !wirelessPartActive && !wirelessStartPending : paused;
   const canStartCameraRecording = !activeLive || session?.startedBy.id === account?.id;
   const currentExercise = training?.exercises.find((exercise) => exercise.endTimeSeconds === null) ?? null;
+  const availablePlannedExercises = useMemo(() => training?.plannedExercises ?? [], [training?.plannedExercises]);
+  const currentPlannedExercise = currentExercise ? training?.plannedExercises.find((plan) => plan.id === currentExercise.plannedExerciseId || plan.number === currentExercise.number) ?? null : null;
+  const displayedPlannedExercise = currentPlannedExercise || training?.plannedExercises.find((plan) => plan.id === selectedPlannedExerciseId) || null;
+  const selectedPlannedExerciseRecording = displayedPlannedExercise ? training?.exercises.find((exercise) => exercise.plannedExerciseId === displayedPlannedExercise.id) ?? null : null;
+  const selectedPlanHasVideo = displayedPlannedExercise?.video?.storageStatus === "READY";
+  const plannedVideoMode = Boolean(selectedPlanHasVideo && plannedVideoUrl && !activeLive);
+  const plannedExerciseSelectionRequired = Boolean(
+    training?.plannedExercises.length
+    && ((!selectedPlannedExerciseId && !currentExercise) || selectedPlanHasVideo || selectedPlannedExerciseRecording),
+  );
   const lastMoment = training?.moments.reduce<MomentRecord | null>((latest, moment) => !latest || Date.parse(moment.createdAt) > Date.parse(latest.createdAt) ? moment : latest, null) || null;
+
+  useEffect(() => {
+    if (!training?.plannedExercises.length || currentExercise) return;
+    if (!availablePlannedExercises.some((plan) => plan.id === selectedPlannedExerciseId)) setSelectedPlannedExerciseId(availablePlannedExercises[0]?.id || "");
+  }, [availablePlannedExercises, currentExercise, selectedPlannedExerciseId, training?.plannedExercises.length]);
+
+  useEffect(() => {
+    plannedVideoExercisePromiseRef.current = null;
+    setPlannedVideoDuration(0);
+    setPlayheadSeconds(0);
+    setPreviewEnd(null);
+    if (!displayedPlannedExercise || displayedPlannedExercise.video?.storageStatus !== "READY" || activeLive) {
+      setPlannedVideoUrl(null);
+      setPlannedVideoLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPlannedVideoLoading(true);
+    getPlannedExerciseVideoUrl(trainingId, displayedPlannedExercise.id)
+      .then((result) => {
+        if (cancelled) return;
+        setPlannedVideoUrl(result.url);
+        setAtLiveEdge(false);
+        setReplayTarget(null);
+      })
+      .catch((error: Error) => { if (!cancelled) setNotice(error.message); })
+      .finally(() => { if (!cancelled) setPlannedVideoLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeLive, displayedPlannedExercise?.id, displayedPlannedExercise?.video?.storageStatus, trainingId]);
 
   useEffect(() => {
     const playbackUrl = session?.playbackUrl;
@@ -747,7 +795,49 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     if (latest) openSegment(latest, 0, true, false);
   }, [atLiveEdge, availableEdgeSeconds, cameraConnected, openSegment, readySegments, remoteLiveStream, seekVirtual, wirelessPartActive]);
 
+  const ensurePlannedVideoExercise = useCallback(async () => {
+    if (!training || !displayedPlannedExercise || !plannedVideoMode) throw new Error("Select an exercise with a video first.");
+    const existing = training.exercises.find((exercise) => exercise.plannedExerciseId === displayedPlannedExercise.id);
+    if (existing) return existing.id;
+    if (plannedVideoExercisePromiseRef.current) return plannedVideoExercisePromiseRef.current;
+    const promise = (async () => {
+      const started = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, {
+        method: "POST",
+        body: JSON.stringify({ action: "start", timeSeconds: 0, plannedExerciseId: displayedPlannedExercise.id }),
+      });
+      const ended = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, {
+        method: "POST",
+        body: JSON.stringify({ action: "end", timeSeconds: Math.max(0.1, plannedVideoDuration || displayedPlannedExercise.video?.durationSeconds || 0.1) }),
+      });
+      setTraining((current) => current ? {
+        ...current,
+        exercises: [...current.exercises.filter((exercise) => exercise.id !== started.id), ended].sort((a, b) => a.number - b.number),
+        exerciseCount: current.exercises.some((exercise) => exercise.id === started.id) ? current.exerciseCount : current.exerciseCount + 1,
+      } : current);
+      return ended.id;
+    })();
+    plannedVideoExercisePromiseRef.current = promise;
+    try { return await promise; }
+    finally { plannedVideoExercisePromiseRef.current = null; }
+  }, [displayedPlannedExercise, plannedVideoDuration, plannedVideoMode, training, trainingId]);
+
   const markMoment = useCallback(async (momentTypeId: string) => {
+    if (plannedVideoMode) {
+      if (currentTime <= 0) return setNotice("Move the exercise video forward before tagging a moment.");
+      setBusyMomentTypeId(momentTypeId);
+      try {
+        const exerciseId = await ensurePlannedVideoExercise();
+        const saved = await apiFetch<MomentRecord>(`/api/trainings/${trainingId}/moments`, {
+          method: "POST",
+          body: JSON.stringify({ momentTypeId, exerciseId, startTimeSeconds: Math.max(0, roundTime(currentTime - 20)), endTimeSeconds: roundTime(currentTime) }),
+        });
+        setTraining((current) => current ? { ...current, moments: [...current.moments, saved].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds), momentCount: current.momentCount + 1 } : current);
+        setSelectedMomentId(saved.id);
+        setNotice(`${saved.momentType.name} saved in exercise ${displayedPlannedExercise?.number}.`);
+      } catch (error) { setNotice(error instanceof Error ? error.message : "The moment could not be saved."); }
+      finally { setBusyMomentTypeId(null); }
+      return;
+    }
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a moment.");
     if (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
     if (partPaused && !externalLinkMode) return setNotice("Start an exercise before tagging a new moment.");
@@ -768,9 +858,24 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     } finally {
       setBusyMomentTypeId(null);
     }
-  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, trainingId, partPaused, playheadSeconds, recording, remoteLiveStream, session, wirelessPartActive]);
+  }, [atLiveEdge, currentTime, displayedPlannedExercise?.number, ensurePlannedVideoExercise, externalLinkMode, liveEdgeSeconds, localParts, plannedVideoMode, trainingId, partPaused, playheadSeconds, recording, remoteLiveStream, session, wirelessPartActive]);
 
   const markPlayerAction = useCallback(async (playerId: string) => {
+    if (plannedVideoMode) {
+      if (currentTime <= 0) return setNotice("Move the exercise video forward before tagging a player action.");
+      setBusyPlayerId(playerId);
+      try {
+        const exerciseId = await ensurePlannedVideoExercise();
+        const saved = await apiFetch<PlayerActionRecord>(`/api/trainings/${trainingId}/player-actions`, {
+          method: "POST",
+          body: JSON.stringify({ playerId, exerciseId, startTimeSeconds: Math.max(0, roundTime(currentTime - 15)), endTimeSeconds: roundTime(currentTime) }),
+        });
+        setTraining((current) => current ? { ...current, playerActions: [...current.playerActions, saved].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds), playerActionCount: current.playerActionCount + 1 } : current);
+        setNotice(`${saved.player.name}: previous 15 seconds saved in exercise ${displayedPlannedExercise?.number}.`);
+      } catch (error) { setNotice(error instanceof Error ? error.message : "The player action could not be saved."); }
+      finally { setBusyPlayerId(null); }
+      return;
+    }
     if (!session || session.status !== "LIVE") return setNotice("Wait for the live session to start before tagging a player action.");
     if (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
     if (partPaused && !externalLinkMode) return setNotice("Start an exercise before tagging a player action.");
@@ -790,10 +895,13 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     } finally {
       setBusyPlayerId(null);
     }
-  }, [atLiveEdge, currentTime, externalLinkMode, liveEdgeSeconds, localParts, partPaused, playheadSeconds, recording, remoteLiveStream, session, trainingId, wirelessPartActive]);
+  }, [atLiveEdge, currentTime, displayedPlannedExercise?.number, ensurePlannedVideoExercise, externalLinkMode, liveEdgeSeconds, localParts, partPaused, plannedVideoMode, playheadSeconds, recording, remoteLiveStream, session, trainingId, wirelessPartActive]);
 
   async function startExerciseAt(timeSeconds: number) {
-    const exercise = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, { method: "POST", body: JSON.stringify({ action: "start", timeSeconds: roundTime(timeSeconds) }) });
+    if (training?.plannedExercises.length && !selectedPlannedExerciseId) throw new Error("Select the planned exercise to record first.");
+    if (displayedPlannedExercise?.video?.storageStatus === "READY") throw new Error("This exercise already has an uploaded video. Select an exercise without a video to record live.");
+    if (selectedPlannedExerciseRecording) throw new Error("This exercise already has a recording. Select another exercise to record live.");
+    const exercise = await apiFetch<TrainingDetail["exercises"][number]>(`/api/trainings/${trainingId}/exercises`, { method: "POST", body: JSON.stringify({ action: "start", timeSeconds: roundTime(timeSeconds), plannedExerciseId: selectedPlannedExerciseId || null }) });
     setTraining((current) => current ? { ...current, exercises: [...current.exercises, exercise], exerciseCount: current.exerciseCount + 1 } : current);
     return exercise;
   }
@@ -813,7 +921,14 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
         event.preventDefault();
         setPreviewEnd(null);
-        void seekVirtual(currentTime + (event.key === "ArrowLeft" ? -5 : 5), atLiveEdge || playing);
+        const offset = event.key === "ArrowLeft" ? -5 : 5;
+        if (plannedVideoMode && replayVideoRef.current) {
+          const next = Math.max(0, Math.min(plannedVideoDuration, currentTime + offset));
+          replayVideoRef.current.currentTime = next;
+          setPlayheadSeconds(next);
+        } else {
+          void seekVirtual(currentTime + offset, atLiveEdge || playing);
+        }
         return;
       }
       if (event.code === "Space") {
@@ -828,7 +943,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [atLiveEdge, currentTime, editingPlayerAction, editingTraining, editingMoment, markMoment, playing, seekVirtual, settings?.momentTypes, togglePlayback]);
+  }, [atLiveEdge, currentTime, editingPlayerAction, editingTraining, editingMoment, markMoment, plannedVideoDuration, plannedVideoMode, playing, seekVirtual, settings?.momentTypes, togglePlayback]);
 
   function monitorCameraStream(stream: MediaStream) {
     const videoTrack = stream.getVideoTracks()[0];
@@ -1622,13 +1737,26 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
   function seekBy(seconds: number) {
     setPreviewEnd(null);
+    if (plannedVideoMode && replayVideoRef.current) {
+      const next = Math.max(0, Math.min(plannedVideoDuration, currentTime + seconds));
+      replayVideoRef.current.currentTime = next;
+      setPlayheadSeconds(next);
+      return;
+    }
     void seekVirtual(currentTime + seconds, atLiveEdge || playing);
   }
 
   function goToExactTime() {
     const seconds = Number(seekTime);
-    if (!Number.isFinite(seconds) || seconds < 0 || seconds > availableEdgeSeconds) return setNotice(`Enter a second between 0 and ${formatTime(availableEdgeSeconds)}.`);
+    const edge = plannedVideoMode ? plannedVideoDuration : availableEdgeSeconds;
+    if (!Number.isFinite(seconds) || seconds < 0 || seconds > edge) return setNotice(`Enter a second between 0 and ${formatTime(edge)}.`);
     setPreviewEnd(null);
+    if (plannedVideoMode && replayVideoRef.current) {
+      replayVideoRef.current.currentTime = seconds;
+      setPlayheadSeconds(seconds);
+      void replayVideoRef.current.play();
+      return;
+    }
     void seekVirtual(seconds, true);
   }
 
@@ -1651,6 +1779,13 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
   function reviewTaggedClip(moment: MomentRecord) {
     setPreviewEnd(moment.endTimeSeconds);
+    if (plannedVideoMode && replayVideoRef.current) {
+      setPendingMomentReviewId(null);
+      replayVideoRef.current.currentTime = moment.startTimeSeconds;
+      setPlayheadSeconds(moment.startTimeSeconds);
+      void replayVideoRef.current.play();
+      return;
+    }
     const sources: TimedVideoSource[] = readySegments
       .filter((segment) => segment.playbackUrl && segment.durationSeconds)
       .map((segment) => ({ sourceUrl: segment.playbackUrl!, startedAtSeconds: segment.startedAtSeconds, durationSeconds: segment.durationSeconds! }));
@@ -1887,12 +2022,20 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   if (loading) return <div className="flex min-h-[65vh] items-center justify-center text-slate-400"><Loader2 className="mr-2 animate-spin" />Preparing Live Training…</div>;
   if (!training || !settings) return <Panel className="border-red-400/20 p-5 text-red-100">{notice || "This training could not be opened."}</Panel>;
 
-  const timelineDuration = Math.max(1, liveEdgeSeconds, ...training.moments.map((moment) => moment.endTimeSeconds), ...training.playerActions.map((action) => action.endTimeSeconds));
+  const selectedExerciseId = plannedVideoMode ? selectedPlannedExerciseRecording?.id ?? null : null;
+  const visibleMoments = plannedVideoMode
+    ? selectedExerciseId ? training.moments.filter((moment) => moment.exerciseId === selectedExerciseId) : []
+    : training.moments;
+  const visiblePlayerActions = plannedVideoMode
+    ? selectedExerciseId ? training.playerActions.filter((action) => action.exerciseId === selectedExerciseId) : []
+    : training.playerActions;
+  const playbackEdgeSeconds = plannedVideoMode ? plannedVideoDuration : availableEdgeSeconds;
+  const timelineDuration = Math.max(1, plannedVideoMode ? plannedVideoDuration : liveEdgeSeconds, ...visibleMoments.map((moment) => moment.endTimeSeconds), ...visiblePlayerActions.map((action) => action.endTimeSeconds));
   const taggedEntries: TaggedEntry[] = [
-    ...training.moments.map((item) => ({ kind: "moment" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
-    ...training.playerActions.map((item) => ({ kind: "player" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
+    ...visibleMoments.map((item) => ({ kind: "moment" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
+    ...visiblePlayerActions.map((item) => ({ kind: "player" as const, id: item.id, startTimeSeconds: item.startTimeSeconds, item })),
   ].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds || a.id.localeCompare(b.id));
-  const canReplay = readySegments.length > 0;
+  const canReplay = plannedVideoMode || readySegments.length > 0;
   const behindLive = activeLive ? Math.max(0, liveEdgeSeconds - currentTime) : 0;
   const showingRemoteLive = Boolean(activeLive && atLiveEdge && !cameraConnected && remoteLiveStream);
   const captureDiagnosticSummary = [
@@ -1946,7 +2089,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
         <button type="button" title="Copy live training link" aria-label="Copy live training link" onClick={() => void copyLiveLink()} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-white/[.06] hover:text-white"><Copy size={13} /></button>
       </div>
       <div className="order-3 grid w-full min-w-0 grid-cols-2 gap-1.5 px-2 py-1.5 sm:grid-cols-3 lg:grid-cols-6 xl:order-none xl:flex xl:w-auto xl:items-center" aria-label="Tag the previous 20 seconds">
-        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
+        {settings.momentTypes.filter((type) => type.active).map((type) => { const busy = busyMomentTypeId === type.id; const taggingUnavailable = !plannedVideoMode && (!activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode)); return <button key={type.id} type="button" disabled={taggingUnavailable || busyMomentTypeId !== null} onClick={() => void markMoment(type.id)} title={`${type.name}: save the previous 20 seconds${type.defaultShortcut ? ` · ${type.defaultShortcut.toUpperCase()}` : ""}`} className={`flex h-11 w-full min-w-0 items-center justify-start gap-1.5 rounded-md border px-2 text-left transition xl:flex-1 xl:basis-0 2xl:justify-between ${busy ? "border-cyan-200/70 bg-cyan-300/10 text-white shadow-[0_0_16px_rgba(34,211,238,.18)]" : "border-white/10 bg-white/[.035] hover:bg-white/[.08]"} disabled:opacity-40`}><span className="min-w-0 flex-1"><span className="line-clamp-2 text-[9px] font-bold leading-3 2xl:block 2xl:truncate" style={{ color: type.color }}>{type.name}</span><span className="mt-0.5 hidden text-[8px] text-slate-600 2xl:block">{busy ? "Saving…" : taggingUnavailable ? "Recording stopped" : "Previous 20s"}</span></span><kbd className="hidden shrink-0 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 text-[9px] text-slate-300 2xl:inline-flex">{type.defaultShortcut || "—"}</kbd></button>; })}
       </div>
       <div className="ml-auto flex min-w-0 items-center justify-end gap-1 border-l border-white/10 px-1.5 max-md:w-full max-md:border-b max-md:border-l-0 max-xl:flex-1">
         <Select aria-label="Camera" title="Camera" className="h-8 min-w-0 flex-1 py-0 text-[10px] sm:w-28 sm:flex-none" value={deviceId} onChange={(event) => changeCameraDevice(event.target.value)} disabled={wirelessMode || recording || pausing || stopping}>{devices.length === 0 ? <option value="">Default camera</option> : devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}</Select>
@@ -1972,9 +2115,12 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
         ><Camera size={13} /></Button>
         <Button size="icon" className="h-8 w-8" title="Use a YouTube video or live-stream link" aria-label="Use a YouTube link" onClick={() => { setExternalLinkInput(session?.provider === "external-link" ? session.playbackUrl || "" : ""); setShowExternalLink((value) => !value); }} disabled={recording || wirelessPartActive || wirelessStartPending || stopping}><Link2 size={13} /></Button>
         <Button size="icon" className="h-8 w-8" title={wirelessMode ? "Wireless phone camera already paired" : "Connect a wireless phone camera"} aria-label="Connect a wireless phone camera" onClick={() => setPairingPhone(true)} disabled={wirelessMode || recording || wirelessPartActive || wirelessStartPending || stopping}><Smartphone size={13} /></Button>
-        {externalLinkMode && activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopExternalLink()} disabled={stopping}><CircleStop size={12} />{stopping ? "Ending…" : "End link"}</Button> : wirelessMode ? (!activeLive || partPaused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startWirelessExercise()} disabled={!wirelessCamera?.ready || wirelessStartPending || pausing || stopping}>{wirelessStartPending || pausing ? <Loader2 size={12} className="animate-spin" /> : <Radio size={12} />}{wirelessStartPending ? "Starting…" : activeLive ? "Start next exercise" : wirelessCamera?.ready ? "Start exercise" : "Waiting for phone"}</Button>{activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button> : null}</> : <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseWirelessExercise()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></>) : !activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={stopping}><Radio size={12} />Start exercise</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={pausing || stopping}><Play size={12} />Start exercise</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End training</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={!canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving exercise…" : "Start exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End training</Button></>}
+        {training.plannedExercises.length ? <Select aria-label="Exercise to record" title="Exercise to record" className="h-8 w-36 py-0 text-[10px]" value={currentPlannedExercise?.id || selectedPlannedExerciseId} onChange={(event) => setSelectedPlannedExerciseId(event.target.value)} disabled={Boolean(currentExercise) || recording || wirelessPartActive || wirelessStartPending || pausing || stopping}><option value="">Select exercise…</option>{currentPlannedExercise ? <option value={currentPlannedExercise.id}>Ex. {currentPlannedExercise.number} · {currentPlannedExercise.name}</option> : availablePlannedExercises.map((plan) => <option key={plan.id} value={plan.id}>Ex. {plan.number} · {plan.name}</option>)}</Select> : null}
+        {externalLinkMode && activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopExternalLink()} disabled={stopping}><CircleStop size={12} />{stopping ? "Ending…" : "End link"}</Button> : wirelessMode ? (!activeLive || partPaused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startWirelessExercise()} disabled={!wirelessCamera?.ready || plannedExerciseSelectionRequired || wirelessStartPending || pausing || stopping}>{wirelessStartPending || pausing ? <Loader2 size={12} className="animate-spin" /> : <Radio size={12} />}{wirelessStartPending ? "Starting…" : activeLive ? "Start selected exercise" : wirelessCamera?.ready ? "Start exercise" : "Waiting for phone"}</Button>{activeLive ? <Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button> : null}</> : <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseWirelessExercise()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopWirelessTraining()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></>) : !activeLive ? <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={plannedExerciseSelectionRequired || stopping}><Radio size={12} />Start exercise</Button> : recording ? <><Button size="sm" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void pauseRecording()} disabled={pausing || stopping}><Pause size={12} />{pausing ? "Saving exercise…" : "End exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />{stopping ? "Finalizing…" : "End training"}</Button></> : paused ? <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void resumeRecording()} disabled={plannedExerciseSelectionRequired || pausing || stopping}><Play size={12} />Start selected exercise</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={pausing || stopping}><CircleStop size={12} />End training</Button></> : <><Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void startLive()} disabled={plannedExerciseSelectionRequired || !canStartCameraRecording || pausing || stopping}><Radio size={12} />{pausing ? "Saving exercise…" : "Start exercise"}</Button><Button size="sm" variant="danger" className="h-8 whitespace-nowrap px-2 text-[10px]" onClick={() => void stopLive()} disabled={!canStartCameraRecording || pausing || stopping}><CircleStop size={12} />End training</Button></>}
       </div>
     </Panel>
+
+    {displayedPlannedExercise ? <Panel className="flex shrink-0 items-center gap-3 overflow-hidden p-2"><div className="relative h-16 w-24 shrink-0 overflow-hidden rounded-md bg-black/30">{displayedPlannedExercise.imageUrl ? <Image unoptimized fill src={displayedPlannedExercise.imageUrl} alt={displayedPlannedExercise.name} className="object-contain" /> : <div className="flex h-full items-center justify-center text-[9px] text-slate-600">No image</div>}</div><div className="min-w-0 flex-1"><p className="text-[9px] font-bold uppercase tracking-[.16em] text-cyan-300">Exercise {displayedPlannedExercise.number}{displayedPlannedExercise.durationMinutes ? ` · ${displayedPlannedExercise.durationMinutes} min` : ""}</p><p className="truncate text-sm font-semibold text-white">{displayedPlannedExercise.name}</p><p className="line-clamp-2 text-[10px] leading-4 text-slate-500">{displayedPlannedExercise.description || "No description added."}</p></div><Link href={`/trainings/${trainingId}/plan`}><Button size="sm"><Pencil size={13} />Plan</Button></Link></Panel> : null}
 
     {showExternalLink ? <Panel className="flex shrink-0 flex-col gap-2 border-cyan-300/20 p-3 sm:flex-row sm:items-end"><label className="grid min-w-0 flex-1 gap-1"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-slate-500">YouTube video or live-stream link</span><input autoFocus type="url" value={externalLinkInput} onChange={(event) => setExternalLinkInput(event.target.value)} placeholder="https://www.youtube.com/watch?v=…" className="h-9 w-full rounded-md border border-white/10 bg-black/20 px-3 text-xs text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" /></label><Button variant="primary" className="h-9 shrink-0" disabled={startingExternalLink || !externalLinkInput.trim()} onClick={() => void startExternalLink()}>{startingExternalLink ? <Loader2 size={14} className="animate-spin" /> : <Link2 size={14} />}Show video</Button><Button className="h-9 shrink-0" onClick={() => setShowExternalLink(false)}>Cancel</Button><p className="text-[10px] leading-4 text-slate-500 sm:max-w-72">Everyone in this workspace who opens the training will see the same source. YouTube playback controls remain available in the player.</p></Panel> : null}
 
@@ -1995,14 +2141,41 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
     <div className="grid min-h-0 flex-1 items-stretch gap-2 xl:grid-cols-[16rem_minmax(0,1fr)_16rem]">
       <Panel className="order-2 flex min-h-0 min-w-0 flex-col overflow-hidden">
         <div className="relative aspect-video min-h-72 shrink-0 bg-black xl:aspect-auto xl:min-h-0 xl:flex-1">
-          {externalLinkMode && session?.playbackUrl ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} /> : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? wirelessMode ? "Phone camera ready" : "Exercise recording saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the training camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next exercise from this computer." : "Recording continues while you independently control replay."}</p></div>}
+          {plannedVideoMode ? <video
+            key={plannedVideoUrl}
+            ref={replayVideoRef}
+            src={plannedVideoUrl!}
+            crossOrigin="anonymous"
+            playsInline
+            className="h-full w-full object-contain"
+            onLoadedMetadata={(event) => {
+              const video = event.currentTarget;
+              const duration = Number.isFinite(video.duration) ? video.duration : displayedPlannedExercise?.video?.durationSeconds || 0;
+              setPlannedVideoDuration(duration);
+              video.playbackRate = playbackRate;
+              video.muted = !soundEnabled;
+            }}
+            onTimeUpdate={(event) => {
+              const video = event.currentTarget;
+              setPlayheadSeconds(video.currentTime);
+              if (previewEnd !== null && video.currentTime >= previewEnd - 0.04) {
+                video.pause();
+                video.currentTime = previewEnd;
+                setPlayheadSeconds(previewEnd);
+                setPreviewEnd(null);
+              }
+            }}
+            onPlay={() => setPlaying(true)}
+            onPause={() => setPlaying(false)}
+            onEnded={() => setPlaying(false)}
+          /> : plannedVideoLoading ? <div className="flex h-full min-h-72 flex-col items-center justify-center gap-3 text-sm text-slate-400"><Loader2 size={30} className="animate-spin text-cyan-200" />Loading exercise video…</div> : externalLinkMode && session?.playbackUrl ? <YouTubePlayer url={session.playbackUrl} soundEnabled={soundEnabled} onTimeUpdate={(seconds) => { setExternalPlayerReady(true); setExternalPlayerTime(seconds); setExternalPlayerEdge((current) => Math.max(current, seconds)); }} /> : atLiveEdge && cameraConnected ? <video ref={cameraVideoRef} muted autoPlay playsInline className="h-full w-full object-contain" /> : showingRemoteLive ? <video ref={remoteLiveVideoRef} autoPlay playsInline className="h-full w-full object-contain" onPlay={() => { setPlaying(true); setRemotePlaybackNeedsAction(false); }} onPause={() => setPlaying(false)} /> : selectedSegment?.playbackUrl ? <video key={selectedSegment.id} ref={replayVideoRef} src={selectedSegment.playbackUrl} crossOrigin="anonymous" playsInline className="h-full w-full object-contain" onTimeUpdate={(event) => handleReplayTimeUpdate(event.currentTarget)} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={advanceReplay} /> : <div className="flex h-full min-h-72 flex-col items-center justify-center p-6 text-center"><Video size={48} className="text-cyan-200" /><h2 className="mt-3 font-semibold text-white">{partPaused ? wirelessMode ? "Phone camera ready" : "Exercise recording saved" : activeLive ? realtimeConnecting ? "Connecting to the live camera" : "Waiting for the first live image" : wirelessMode ? "Phone camera ready" : "Connect the training camera"}</h2><p className="mt-2 max-w-lg text-sm text-slate-500">{partPaused ? "Select a tagged moment to review it, or start the next exercise from this computer." : "Recording continues while you independently control replay."}</p></div>}
           {showingRemoteLive && remotePlaybackNeedsAction ? <button type="button" onClick={() => void remoteLiveVideoRef.current?.play()} className="absolute inset-0 flex items-center justify-center bg-black/55 text-sm font-semibold text-white"><span className="rounded-lg border border-cyan-300/35 bg-pitch-950/90 px-4 py-3"><Play size={16} className="mr-2 inline" />Start live video</span></button> : null}
           {activeLive ? <span className={`absolute left-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold text-white ${partPaused ? "bg-amber-600" : "bg-red-600"}`}>{partPaused ? "BETWEEN EXERCISES" : `● EXERCISE ${currentExercise?.number ?? ""}`}</span> : null}
           {activeLive ? <span className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-bold ${atLiveEdge ? "bg-cyan-300 text-slate-950" : "bg-slate-900/85 text-cyan-100"}`}>{atLiveEdge ? "LIVE" : `REPLAY · ${formatTime(behindLive)} behind`}</span> : null}
           {atLiveEdge && cameraConnected ? <span className="absolute bottom-3 left-3 max-w-[calc(100%-1.5rem)] truncate rounded-md border border-white/10 bg-slate-950/75 px-2 py-1 font-mono text-[9px] text-slate-300 backdrop-blur-sm" title={captureDiagnosticSummary}><Activity size={10} className="mr-1 inline text-cyan-300" />{captureProfiles[captureMode].label} · {captureDiagnostics.width && captureDiagnostics.height ? `${captureDiagnostics.width}×${captureDiagnostics.height}` : "detecting"} · {captureDiagnostics.frameRate ? `${Math.round(captureDiagnostics.frameRate)}fps` : "fps—"} · {captureDiagnostics.reconnections}R</span> : null}
         </div>
         <div className="shrink-0 border-t border-white/10 bg-pitch-950/90 p-2">
-          <input aria-label="Live recording position" type="range" min={0} max={Math.max(availableEdgeSeconds, 0.1)} step={0.1} value={Math.min(currentTime, availableEdgeSeconds)} disabled={!canReplay} onChange={(event) => { setPreviewEnd(null); void seekVirtual(Number(event.target.value), atLiveEdge || playing); }} className="h-1.5 w-full cursor-pointer accent-cyan-300 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: availableEdgeSeconds ? `linear-gradient(to right, #67e8f9 ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%, rgba(255,255,255,.14) ${(Math.min(currentTime, availableEdgeSeconds) / availableEdgeSeconds) * 100}%)` : undefined }} />
+          <input aria-label="Video position" type="range" min={0} max={Math.max(playbackEdgeSeconds, 0.1)} step={0.1} value={Math.min(currentTime, playbackEdgeSeconds)} disabled={!canReplay} onChange={(event) => { const seconds = Number(event.target.value); setPreviewEnd(null); if (plannedVideoMode && replayVideoRef.current) { replayVideoRef.current.currentTime = seconds; setPlayheadSeconds(seconds); } else { void seekVirtual(seconds, atLiveEdge || playing); } }} className="h-1.5 w-full cursor-pointer accent-cyan-300 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: playbackEdgeSeconds ? `linear-gradient(to right, #67e8f9 ${(Math.min(currentTime, playbackEdgeSeconds) / playbackEdgeSeconds) * 100}%, rgba(255,255,255,.14) ${(Math.min(currentTime, playbackEdgeSeconds) / playbackEdgeSeconds) * 100}%)` : undefined }} />
           <div className="mt-1.5 flex items-center gap-2">
             <div className="min-w-0 flex-1 overflow-x-auto"><div className="flex min-w-max items-center gap-1">
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Back 15 seconds" onClick={() => seekBy(-15)}><ChevronsLeft size={15} /></Button>
@@ -2011,12 +2184,12 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 5 seconds (right arrow)" onClick={() => seekBy(5)}><ChevronsRight size={15} /></Button>
               <Button size="icon" className="h-8 w-8" disabled={!canReplay} title="Forward 15 seconds" onClick={() => seekBy(15)}><ChevronsRight size={15} className="scale-125" /></Button>
               <div className="flex overflow-hidden rounded-md border border-white/10">{[1, 2, 4].map((rate) => <button key={rate} type="button" onClick={() => setRate(rate)} className={`h-8 px-2 text-[10px] font-semibold transition ${playbackRate === rate ? "bg-cyan-300 text-slate-950" : "bg-white/[.04] text-slate-300 hover:bg-white/[.1]"}`}>{rate}×</button>)}</div>
-              <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" disabled={!activeLive} onClick={goLive}><Radio size={12} />Go Live</Button>
+              <Button size="sm" variant="primary" className="h-8 whitespace-nowrap px-2 text-[10px]" disabled={!activeLive || plannedVideoMode} onClick={goLive}><Radio size={12} />Go Live</Button>
               <Button size="icon" variant="danger" className="h-8 w-8" disabled={!lastMoment} title={lastMoment ? `Delete last recorded moment: ${lastMoment.momentType.name}` : "No recorded moment to delete"} onClick={() => lastMoment && void removeMoment(lastMoment, false)}><Trash2 size={14} /></Button>
-              <div className="ml-1 flex h-8 items-center gap-2 rounded-md border border-emerald-300/25 bg-emerald-300/10 px-2 text-[10px] text-emerald-100"><Dumbbell size={12} />{currentExercise ? `Exercise ${currentExercise.number} active` : `${training.exercises.length} exercises saved`}</div>
-              <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={availableEdgeSeconds || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!canReplay} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" disabled={!canReplay || seekTime === ""}>Go</Button></form>
+              <div className="ml-1 flex h-8 items-center gap-2 rounded-md border border-emerald-300/25 bg-emerald-300/10 px-2 text-[10px] text-emerald-100"><Dumbbell size={12} />{currentExercise ? `Exercise ${currentExercise.number}${currentPlannedExercise ? ` · ${currentPlannedExercise.name}` : ""} active` : `${training.exercises.length} exercises recorded`}</div>
+              <form className="ml-1 flex items-center gap-1 border-l border-white/10 pl-2" onSubmit={(event) => { event.preventDefault(); goToExactTime(); }}><input aria-label="Exact second" className="h-8 w-20 rounded-md border border-white/10 bg-black/20 px-2 font-mono text-[10px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-300/50" type="number" min="0" max={playbackEdgeSeconds || undefined} step="0.1" placeholder="Second" value={seekTime} onChange={(event) => setSeekTime(event.target.value)} disabled={!canReplay} /><Button type="submit" size="sm" className="h-8 px-2 text-[10px]" disabled={!canReplay || seekTime === ""}>Go</Button></form>
             </div></div>
-            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(liveEdgeSeconds)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} /><Link href={`/analysis/${trainingId}`} className="inline-flex h-8 items-center gap-1 rounded-md bg-cyan-300 px-2 text-[10px] font-medium text-slate-950 transition hover:bg-cyan-200">Review recording <ChevronsRight size={13} /></Link></div>
+            <div className="flex shrink-0 items-center gap-2"><span className="hidden items-center gap-1 font-mono text-xs text-white sm:inline-flex"><Clock3 size={13} className="text-cyan-200" />{formatTime(currentTime)} / {formatTime(plannedVideoMode ? plannedVideoDuration : liveEdgeSeconds)}</span><VideoAudioToggle compact soundEnabled={soundEnabled} onChange={setSoundEnabled} />{plannedVideoMode ? <Badge className="border-violet-300/25 bg-violet-300/10 text-violet-100"><Video size={11} />Exercise video</Badge> : <Link href={`/analysis/${trainingId}`} className="inline-flex h-8 items-center gap-1 rounded-md bg-cyan-300 px-2 text-[10px] font-medium text-slate-950 transition hover:bg-cyan-200">Review recording <ChevronsRight size={13} /></Link>}</div>
           </div>
         </div>
       </Panel>
@@ -2028,12 +2201,12 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
 
       <Panel className="order-3 flex min-h-48 flex-col overflow-hidden xl:min-h-0">
         <div className="shrink-0 border-b border-white/10 px-3 py-3"><div className="flex items-start justify-between gap-2"><div><p className="text-xs uppercase tracking-[0.2em] text-slate-500">Players</p><p className="mt-1 text-xs text-slate-400">Click a name to save the previous 15 seconds</p></div><Badge><UserRound size={11} className="mr-1" />{training.participants.length}</Badge></div></div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">{training.participants.length === 0 ? <p className="p-3 text-xs text-slate-500">No players were selected for this training.</p> : training.participants.map(({ player }) => { const busy = busyPlayerId === player.id; const count = training.playerActions.filter((action) => action.playerId === player.id).length; const unavailable = !activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode); return <button key={player.id} type="button" disabled={unavailable || busyPlayerId !== null} onClick={() => void markPlayerAction(player.id)} title={`${player.name}: save the previous 15 seconds`} className="mb-1 flex h-9 w-full items-center gap-2 rounded-md border border-white/10 bg-white/[.035] px-2 text-left transition hover:border-cyan-300/30 hover:bg-cyan-300/10 disabled:opacity-40"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-black/25 font-mono text-[9px] text-cyan-100">{player.shirtNumber ?? "—"}</span><span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">{player.name}</span><span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-white/[.07] px-1 text-[9px] text-slate-400">{busy ? "…" : count}</span></button>; })}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">{training.participants.length === 0 ? <p className="p-3 text-xs text-slate-500">No players were selected for this training.</p> : training.participants.map(({ player }) => { const busy = busyPlayerId === player.id; const count = visiblePlayerActions.filter((action) => action.playerId === player.id).length; const unavailable = !plannedVideoMode && (!activeLive || (partPaused && !externalLinkMode) || (!recording && !remoteLiveStream && !wirelessPartActive && !externalLinkMode)); return <button key={player.id} type="button" disabled={unavailable || busyPlayerId !== null} onClick={() => void markPlayerAction(player.id)} title={`${player.name}: save the previous 15 seconds`} className="mb-1 flex h-9 w-full items-center gap-2 rounded-md border border-white/10 bg-white/[.035] px-2 text-left transition hover:border-cyan-300/30 hover:bg-cyan-300/10 disabled:opacity-40"><span className="flex h-6 w-6 shrink-0 items-center justify-center rounded bg-black/25 font-mono text-[9px] text-cyan-100">{player.shirtNumber ?? "—"}</span><span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">{player.name}</span><span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-white/[.07] px-1 text-[9px] text-slate-400">{busy ? "…" : count}</span></button>; })}</div>
         <div className="shrink-0 border-t border-white/10 px-3 py-2 text-[9px] text-slate-500">{training.playerActionCount} individual actions saved</div>
       </Panel>
     </div>
 
-    <Timeline momentTypes={settings.momentTypes} moments={training.moments} duration={timelineDuration} selectedMomentId={selectedMomentId} onSelect={reviewMoment} />
+    <Timeline momentTypes={settings.momentTypes} moments={visibleMoments} duration={timelineDuration} selectedMomentId={selectedMomentId} onSelect={reviewMoment} />
     {editingMoment ? <MomentEditDialog moment={editingMoment} momentTypes={settings.momentTypes} duration={timelineDuration} onSave={updateMoment} onClose={() => setEditingMoment(null)} /> : null}
     {editingPlayerAction ? <PlayerActionEditDialog action={editingPlayerAction} duration={timelineDuration} onSave={updatePlayerAction} onClose={() => setEditingPlayerAction(null)} /> : null}
     {editingTraining ? <TrainingEditDialog training={training} onSave={saveTraining} onDelete={removeCurrentTraining} onClose={() => setEditingTraining(false)} /> : null}

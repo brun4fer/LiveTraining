@@ -6,12 +6,15 @@ import { ArrowLeft, Loader2, Save, Wrench } from "lucide-react";
 import Link from "next/link";
 
 import { Button, Input, Label, Panel, Select, TextArea } from "@/components/ui";
+import { PlannedExerciseDrafts, type PlannedExerciseDraft } from "@/components/planned-exercise-drafts";
 import type { AccountPayload, MaintenanceRecord, TrainingDetail } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { uploadPlannedExerciseImage } from "@/lib/planned-exercise-image";
 
 export function TrainingForm() {
   const router = useRouter();
   const [form, setForm] = useState({ seasonId: "", microcycleNumber: "", trainingUnitNumber: "", trainingDate: new Date().toISOString().slice(0, 10), notes: "", participantIds: [] as string[] });
+  const [plannedExercises, setPlannedExercises] = useState<PlannedExerciseDraft[]>([]);
   const [seasons, setSeasons] = useState<MaintenanceRecord[]>([]);
   const [players, setPlayers] = useState<MaintenanceRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -40,8 +43,25 @@ export function TrainingForm() {
     setSaving(true);
     setError(null);
     try {
-      const training = await apiFetch<TrainingDetail>("/api/trainings", { method: "POST", body: JSON.stringify(form) });
-      router.push(`/live/${training.id}`);
+      const training = await apiFetch<TrainingDetail>("/api/trainings", { method: "POST", body: JSON.stringify({
+        ...form,
+        plannedExercises: plannedExercises.map((exercise) => ({ name: exercise.name, description: exercise.description, durationMinutes: exercise.durationMinutes })),
+      }) });
+      let failedImages = 0;
+      for (let index = 0; index < plannedExercises.length; index += 1) {
+        const file = plannedExercises[index].imageFile;
+        const saved = training.plannedExercises[index];
+        if (file && saved) {
+          try { await uploadPlannedExerciseImage(training.id, saved.id, file); }
+          catch { failedImages += 1; }
+        }
+      }
+      if (failedImages) {
+        window.alert(`The training was created, but ${failedImages} exercise image${failedImages === 1 ? "" : "s"} could not be uploaded. You can retry from the training plan.`);
+        router.push(`/trainings/${training.id}/plan`);
+      } else {
+        router.push(`/live/${training.id}`);
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not create the training.");
       setSaving(false);
@@ -65,6 +85,7 @@ export function TrainingForm() {
         <label className="grid gap-2 sm:col-span-2"><Label>Notes</Label><TextArea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>
       </div>
       <div className="overflow-hidden rounded-xl border border-white/10 bg-black/15"><div className="flex items-center justify-between border-b border-white/10 px-3 py-2"><div><Label>Players *</Label><p className="mt-1 text-[11px] text-slate-500">{form.participantIds.length} selected</p></div><Button type="button" size="sm" onClick={() => setForm({ ...form, participantIds: allSelected ? [] : players.map((player) => player.id) })}>{allSelected ? "Clear" : "Select all"}</Button></div><div className="grid max-h-[22rem] grid-cols-1 overflow-y-auto p-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">{players.length === 0 ? <p className="p-3 text-sm text-amber-200/70">Create active players in Maintenance first.</p> : players.map((player) => <label key={player.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-200 hover:bg-white/[.05]"><input type="checkbox" checked={form.participantIds.includes(player.id)} onChange={() => togglePlayer(player.id)} className="h-4 w-4 accent-cyan-300" /><span className="flex h-6 min-w-6 items-center justify-center rounded bg-white/[.06] font-mono text-[10px] text-slate-400">{player.shirtNumber ?? "—"}</span><span className="truncate">{player.name}</span></label>)}</div></div>
+      <div className="lg:col-span-2"><PlannedExerciseDrafts exercises={plannedExercises} onChange={setPlannedExercises} /></div>
       <div className="flex justify-end gap-2 lg:col-span-2"><Link href="/"><Button type="button">Cancel</Button></Link><Button variant="primary" disabled={saving || !form.seasonId || !form.microcycleNumber || !form.trainingUnitNumber || !form.trainingDate || form.participantIds.length === 0}><Save size={16} />{saving ? "Saving…" : "Create training"}</Button></div>
     </form>}</Panel>
   </div>;

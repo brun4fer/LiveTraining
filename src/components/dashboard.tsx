@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { Calendar, Clapperboard, Dumbbell, Pencil, Play, Plus, Radio, Search, Trash2, Users } from "lucide-react";
+import { Calendar, Clapperboard, Dumbbell, FileDown, ListChecks, Pencil, Play, Plus, Radio, Search, Trash2, Users } from "lucide-react";
 
 import { TrainingEditDialog } from "@/components/training-edit-dialog";
 import { Badge, Button, Input, Panel } from "@/components/ui";
 import type { AccountPayload, TrainingDetail, TrainingSummary } from "@/lib/domain";
 import { apiFetch } from "@/lib/http";
+import { exportTrainingPdf } from "@/lib/training-pdf";
 
 export function Dashboard() {
   const [trainings, setTrainings] = useState<TrainingSummary[]>([]);
@@ -65,6 +66,18 @@ export function Dashboard() {
     setEditingTraining(null);
   }
 
+  async function exportPdf(trainingId: string) {
+    const popup = window.open("", "_blank", "width=1000,height=800");
+    if (!popup) return setError("Allow pop-ups in the browser to export the training PDF.");
+    popup.document.write("<p style='font-family:Arial;padding:24px'>Preparing training PDF…</p>");
+    try {
+      exportTrainingPdf(await apiFetch<TrainingDetail>(`/api/trainings/${trainingId}`), teamName, popup);
+    } catch (caught) {
+      popup.close();
+      setError(caught instanceof Error ? caught.message : "Could not export the training PDF.");
+    }
+  }
+
   return (
     <div className="space-y-5">
       <section className="grid gap-4 lg:grid-cols-[1fr_22rem]">
@@ -95,9 +108,9 @@ export function Dashboard() {
           <Panel key={training.id} className="flex min-h-60 flex-col justify-between overflow-hidden">
             <div className="p-4">
               <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-lg font-semibold text-white">{training.title}</h2><p className="mt-1 truncate text-sm text-slate-400">{teamName} · {training.season}</p></div><Badge className="shrink-0 border-cyan-300/20 bg-cyan-300/10 text-cyan-100">{training.momentCount} moments</Badge></div>
-              <div className="mt-4 grid gap-2 text-sm text-slate-400"><Info icon={<Calendar size={15} />} value={formatDate(training.trainingDate)} /><Info icon={<Dumbbell size={15} />} value={`${training.exerciseCount} exercises · MC ${training.microcycleNumber} · TU ${training.trainingUnitNumber}`} /><Info icon={<Users size={15} />} value={`${training.participantCount} players · ${training.playerActionCount} actions`} /><Info icon={<Radio size={15} />} value={training.liveStatus === "LIVE" ? "Live recording in progress" : training.liveStatus === "ENDED" ? "Recording ready for review" : "Live session not started"} /></div>
+              <div className="mt-4 grid gap-2 text-sm text-slate-400"><Info icon={<Calendar size={15} />} value={formatDate(training.trainingDate)} /><Info icon={<Dumbbell size={15} />} value={`${training.plannedExerciseCount} planned · ${training.exerciseCount} recorded · MC ${training.microcycleNumber} · TU ${training.trainingUnitNumber}`} /><Info icon={<Users size={15} />} value={`${training.participantCount} players · ${training.playerActionCount} actions`} /><Info icon={<Radio size={15} />} value={training.liveStatus === "LIVE" ? "Live recording in progress" : training.liveStatus === "ENDED" ? "Recording ready for review" : "Live session not started"} /></div>
             </div>
-            <div className="flex items-center gap-2 border-t border-white/10 bg-black/10 p-3"><Link href={`/live/${training.id}`} className="min-w-0 flex-1"><Button variant="primary" className="w-full"><Play size={16} />Open Live Training</Button></Link><Button size="icon" aria-label="Edit training" onClick={() => void openEdit(training.id)}><Pencil size={16} /></Button><Button variant="danger" size="icon" aria-label="Delete training" onClick={() => void removeTraining(training)}><Trash2 size={16} /></Button></div>
+            <div className="flex items-center gap-2 border-t border-white/10 bg-black/10 p-3"><Link href={`/live/${training.id}`} className="min-w-0 flex-1"><Button variant="primary" className="w-full"><Play size={16} />Open Live Training</Button></Link><Link href={`/trainings/${training.id}/plan`}><Button size="icon" aria-label="Plan exercises and upload their videos" title="Exercises: plan and videos"><ListChecks size={16} /></Button></Link><Button size="icon" aria-label="Export training PDF" title="Export PDF" onClick={() => void exportPdf(training.id)}><FileDown size={16} /></Button><Button size="icon" aria-label="Edit training" onClick={() => void openEdit(training.id)}><Pencil size={16} /></Button><Button variant="danger" size="icon" aria-label="Delete training" onClick={() => void removeTraining(training)}><Trash2 size={16} /></Button></div>
           </Panel>
         ))}
       </section>

@@ -67,18 +67,31 @@ export async function readVideoDuration(file: File) {
 }
 
 export async function uploadTrainingVideo(trainingId: string, file: File, onStatus?: (status: UploadStatus) => void, signal?: AbortSignal) {
+  return uploadVideoFile(`/api/trainings/${trainingId}/video`, file, onStatus, signal);
+}
+
+export async function uploadPlannedExerciseVideo(trainingId: string, plannedExerciseId: string, file: File, onStatus?: (status: UploadStatus) => void, signal?: AbortSignal) {
+  return uploadVideoFile(`/api/trainings/${trainingId}/planned-exercises/${plannedExerciseId}/video`, file, onStatus, signal);
+}
+
+export async function getPlannedExerciseVideoUrl(trainingId: string, plannedExerciseId: string) {
+  return apiFetch<{ url: string; expiresAt: string }>(`/api/trainings/${trainingId}/planned-exercises/${plannedExerciseId}/video`);
+}
+
+async function uploadVideoFile(basePath: string, file: File, onStatus?: (status: UploadStatus) => void, signal?: AbortSignal) {
   if (!shouldUploadReplayFromOrigin(window.location)) {
     throw new Error(`Cloud upload is unavailable from ${window.location.origin}. Use http://localhost:3000 on the camera computer or the HTTPS Vercel site.`);
   }
   onStatus?.({ phase: "preparing", progress: 0, detail: "Preparing multipart upload…" });
   const durationSeconds = await readVideoDuration(file);
   const init = await apiFetch<{
-    video: StoredVideo;
+    video?: StoredVideo;
+    exercise?: { video?: StoredVideo | null };
     uploadId: string | null;
     partSize: number;
     completedParts: UploadedPart[];
     alreadyReady: boolean;
-  }>(`/api/trainings/${trainingId}/video/uploads`, {
+  }>(`${basePath}/uploads`, {
     method: "POST",
     body: JSON.stringify({
       fileName: file.name,
@@ -88,7 +101,11 @@ export async function uploadTrainingVideo(trainingId: string, file: File, onStat
       lastModified: new Date(file.lastModified).toISOString(),
     }),
   });
-  if (init.alreadyReady) return { video: init.video, durationSeconds, resumed: false };
+  if (init.alreadyReady) {
+    const video = init.video || init.exercise?.video;
+    if (!video) throw new Error("The server did not return the stored video.");
+    return { video, durationSeconds, resumed: false };
+  }
   if (!init.uploadId) throw new Error("The server did not start the multipart upload.");
 
   const totalParts = Math.ceil(file.size / init.partSize);
@@ -106,7 +123,7 @@ export async function uploadTrainingVideo(trainingId: string, file: File, onStat
     if (missing.length) {
       for (let index = 0; index < missing.length; index += UPLOAD_BATCH_SIZE) {
         const batch = missing.slice(index, index + UPLOAD_BATCH_SIZE);
-        const signed = await apiFetch<{ parts: Array<{ partNumber: number; url: string }> }>(`/api/trainings/${trainingId}/video/uploads/parts`, {
+        const signed = await apiFetch<{ parts: Array<{ partNumber: number; url: string }> }>(`${basePath}/uploads/parts`, {
           method: "POST",
           body: JSON.stringify({ uploadId: init.uploadId, partNumbers: batch }),
         });
@@ -130,14 +147,16 @@ export async function uploadTrainingVideo(trainingId: string, file: File, onStat
       }
     }
     onStatus?.({ phase: "finishing", progress: 1, detail: "Finalizing the video in Cloudflare R2…" });
-    const result = await apiFetch<{ video: StoredVideo }>(`/api/trainings/${trainingId}/video/uploads/complete`, {
+    const result = await apiFetch<{ video?: StoredVideo; exercise?: { video?: StoredVideo | null } }>(`${basePath}/uploads/complete`, {
       method: "POST",
       body: JSON.stringify({ uploadId: init.uploadId, partSize: init.partSize, parts: [...completed.values()].map(({ partNumber, etag }) => ({ partNumber, etag })) }),
     });
-    return { video: result.video, durationSeconds, resumed: init.completedParts.length > 0 };
+    const video = result.video || result.exercise?.video;
+    if (!video) throw new Error("The server completed the upload without returning the stored video.");
+    return { video, durationSeconds, resumed: init.completedParts.length > 0 };
   } catch (error) {
     if (signal?.aborted) {
-      await apiFetch(`/api/trainings/${trainingId}/video/uploads`, { method: "DELETE", body: JSON.stringify({ uploadId: init.uploadId }) }).catch(() => undefined);
+      await apiFetch(`${basePath}/uploads`, { method: "DELETE", body: JSON.stringify({ uploadId: init.uploadId }) }).catch(() => undefined);
       throw new DOMException("The video upload was cancelled.", "AbortError");
     }
     const message = error instanceof Error ? error.message : "The upload was interrupted.";
