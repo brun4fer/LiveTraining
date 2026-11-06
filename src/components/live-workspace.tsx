@@ -1132,7 +1132,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
   async function startRealtimePublisher(activeSession: LiveSessionRecord) {
     closeWebRtcSession(publisherSessionRef.current);
     publisherSessionRef.current = null;
-    if (!activeSession.publishUrl) return null;
+    if (!activeSession.publishUrl) return activeSession.realtimeError || "Cloudflare realtime sharing is not available. The recording remains local, but other devices cannot watch the camera live.";
     if (!captureStreamRef.current) return "The camera stream is not available for realtime sharing.";
     try {
       const published = await publishCameraStream(captureStreamRef.current, activeSession.publishUrl);
@@ -1159,7 +1159,7 @@ export function LiveWorkspace({ trainingId }: { trainingId: string }) {
         method: "POST",
         body: JSON.stringify({
           sourceType: "BROWSER_CAMERA",
-          enableRealtime: process.env.NEXT_PUBLIC_LIVE_CLOUD_REPLAY_ENABLED === "true",
+          enableRealtime: true,
         }),
       });
       setSession(next);
