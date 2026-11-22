@@ -58,7 +58,7 @@ export async function POST(request: Request, context: { params: Promise<{ traini
     }
 
     const assetId = randomUUID();
-    const storageKey = `workspaces/${mediaWorkspace.id}/training-exercises/${plannedExerciseId}/${assetId}/video`;
+    const storageKey = `libraries/${appId}/workspaces/${mediaWorkspace.id}/training-exercises/${plannedExerciseId}/${assetId}/video`;
     const uploadId = await createMediaMultipartUpload(storageKey, mimeType);
     created = { id: assetId, key: storageKey, uploadId };
     await mediaPrisma.mediaAsset.create({ data: {
