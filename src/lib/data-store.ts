@@ -9,6 +9,7 @@ import { ensureMediaWorkspace } from "@/lib/media-workspace";
 import { plannedExerciseVideoReferenceId } from "@/lib/planned-exercise-video";
 import { abortMultipartUpload, deleteR2Object } from "@/lib/r2";
 import { serializeVideo } from "@/lib/video";
+import { importTrainingExercisesPlan } from "@/lib/training-exercises-import";
 
 export const trainingInclude = {
   video: true,
@@ -96,13 +97,13 @@ export async function getTraining(trainingId: string) {
 }
 
 export async function createTraining(input: Record<string, unknown>) {
-  const { workspace } = await requireManagementWorkspace();
+  const { workspace, user } = await requireManagementWorkspace();
   const seasonId = String(input.seasonId || "");
   const microcycleNumber = positiveInteger(input.microcycleNumber, "Microcycle");
   const trainingUnitNumber = positiveInteger(input.trainingUnitNumber, "Training unit");
   const trainingDate = validDate(input.trainingDate);
   const participantIds = stringArray(input.participantIds);
-  const plannedExercises = plannedExerciseInputs(input.plannedExercises);
+  let plannedExercises = plannedExerciseInputs(input.plannedExercises);
   if (!seasonId) throw new Error("Season is required.");
   if (participantIds.length === 0) throw new Error("Select at least one player for this training.");
 
@@ -111,6 +112,8 @@ export async function createTraining(input: Record<string, unknown>) {
     prisma.player.count({ where: { id: { in: participantIds }, workspaceId: workspace.id, active: true } }),
   ]);
   if (playerCount !== participantIds.length) throw new Error("One or more selected players are unavailable.");
+  const importedPlan = await importTrainingExercisesPlan({ username: user.username, workspaceName: workspace.name, date: trainingDate.toISOString().slice(0, 10), season: season.name, microcycle: String(microcycleNumber), trainingUnit: String(trainingUnitNumber) });
+  if (importedPlan?.length) plannedExercises = importedPlan;
   const title = `${season.name} · MC ${microcycleNumber} · TU ${trainingUnitNumber}`;
 
   const training = await prisma.training.create({
@@ -214,7 +217,7 @@ export function serializePlannedExercise(exercise: Record<string, unknown>) {
   return {
     ...exercise,
     imageStorageKey: undefined,
-    imageUrl: imageStorageKey ? createMediaPlaybackUrl(imageStorageKey).url : null,
+    imageUrl: imageStorageKey ? createMediaPlaybackUrl(imageStorageKey).url : typeof exercise.diagramSvg === "string" ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(exercise.diagramSvg)}` : null,
     videoFileName: undefined,
     videoFileSize: undefined,
     videoDurationSeconds: undefined,
@@ -464,6 +467,7 @@ function plannedExerciseInputs(value: unknown) {
       name: requiredShortText(input.name || `Exercise ${index + 1}`, "Exercise name", 120),
       description: optionalLimitedString(input.description, 4_000),
       durationMinutes: optionalPositiveInteger(input.durationMinutes, "Duration"),
+      diagramSvg: optionalLimitedString(input.diagramSvg, 200_000),
     };
   });
 }

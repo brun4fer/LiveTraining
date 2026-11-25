@@ -25,6 +25,7 @@ export type PlannedExerciseRecord = {
   number: number;
   name: string;
   description: string | null;
+  diagramSvg?: string | null;
   durationMinutes: number | null;
   imageFileName: string | null;
   imageMimeType: string | null;

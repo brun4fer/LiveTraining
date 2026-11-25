@@ -213,6 +213,7 @@ model PlannedExercise {
   number               Int
   name                 String
   description          String?
+  diagramSvg           String?
   durationMinutes      Int?
   imageStorageKey      String?             @unique
   imageFileName        String?
