@@ -9,7 +9,7 @@ import { ensureMediaWorkspace } from "@/lib/media-workspace";
 import { plannedExerciseVideoReferenceId } from "@/lib/planned-exercise-video";
 import { abortMultipartUpload, deleteR2Object } from "@/lib/r2";
 import { serializeVideo } from "@/lib/video";
-import { importTrainingExercisesPlan } from "@/lib/training-exercises-import";
+import { importTrainingExercisesPlan, importTrainingExercisesProject } from "@/lib/training-exercises-import";
 
 export const trainingInclude = {
   video: true,
@@ -112,7 +112,10 @@ export async function createTraining(input: Record<string, unknown>) {
     prisma.player.count({ where: { id: { in: participantIds }, workspaceId: workspace.id, active: true } }),
   ]);
   if (playerCount !== participantIds.length) throw new Error("One or more selected players are unavailable.");
-  const importedPlan = await importTrainingExercisesPlan({ username: user.username, workspaceName: workspace.name, date: trainingDate.toISOString().slice(0, 10), season: season.name, microcycle: String(microcycleNumber), trainingUnit: String(trainingUnitNumber) });
+  const selectedTrainingExercisesProjectId = optionalString(input.trainingExercisesProjectId);
+  const importedPlan = selectedTrainingExercisesProjectId
+    ? await importTrainingExercisesProject({ username: user.username, workspaceName: workspace.name, projectId: selectedTrainingExercisesProjectId })
+    : await importTrainingExercisesPlan({ username: user.username, workspaceName: workspace.name, date: trainingDate.toISOString().slice(0, 10), season: season.name, microcycle: String(microcycleNumber), trainingUnit: String(trainingUnitNumber) });
   if (importedPlan?.length) plannedExercises = importedPlan;
   const title = `${season.name} · MC ${microcycleNumber} · TU ${trainingUnitNumber}`;
 
